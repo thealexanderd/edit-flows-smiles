@@ -62,9 +62,9 @@ class EditFlowModel(nn.Module):
     Transformer encoder policy network for predicting edit operations.
     
     Outputs:
-        - p_del: [B, S] probability of deletion at each position
-        - p_sub: [B, S] probability of substitution at each position
-        - p_ins: [B, S+1] probability of insertion at each gap
+        - del_rate_logits: [B, S] rate logits for deletion at each position
+        - sub_rate_logits: [B, S] rate logits for substitution at each position
+        - ins_rate_logits: [B, S+1] rate logits for insertion at each gap
         - sub_tok_logits: [B, S, V] token logits for substitution
         - ins_tok_logits: [B, S+1, V] token logits for insertion
     """
@@ -140,7 +140,7 @@ class EditFlowModel(nn.Module):
             t: [B] time values
             
         Returns:
-            (p_del, p_sub, p_ins, sub_tok_logits, ins_tok_logits)
+            (del_rate_logits, sub_rate_logits, ins_rate_logits, sub_tok_logits, ins_tok_logits)
         """
         B, S = token_ids.shape
         
@@ -196,12 +196,7 @@ class EditFlowModel(nn.Module):
         ins_logits = self.ins_head(gap_H).squeeze(-1)  # [B, S+1]
         ins_tok_logits = self.ins_tok_head(gap_H)  # [B, S+1, V]
         
-        # Apply sigmoid to get probabilities
-        p_del = torch.sigmoid(del_logits)  # [B, S]
-        p_sub = torch.sigmoid(sub_logits)  # [B, S]
-        p_ins = torch.sigmoid(ins_logits)  # [B, S+1]
-        
-        return p_del, p_sub, p_ins, sub_tok_logits, ins_tok_logits
+        return del_logits, sub_logits, ins_logits, sub_tok_logits, ins_tok_logits
 
 
 if __name__ == "__main__":
@@ -218,17 +213,17 @@ if __name__ == "__main__":
     attn_mask[:, -2:] = False  # Mask last 2 positions
     t = torch.rand(B)
     
-    p_del, p_sub, p_ins, sub_tok_logits, ins_tok_logits = model(token_ids, attn_mask, t)
+    del_logits, sub_logits, ins_logits, sub_tok_logits, ins_tok_logits = model(token_ids, attn_mask, t)
     
-    print(f"  p_del shape: {p_del.shape}")
-    print(f"  p_sub shape: {p_sub.shape}")
-    print(f"  p_ins shape: {p_ins.shape}")
+    print(f"  del_logits shape: {del_logits.shape}")
+    print(f"  sub_logits shape: {sub_logits.shape}")
+    print(f"  ins_logits shape: {ins_logits.shape}")
     print(f"  sub_tok_logits shape: {sub_tok_logits.shape}")
     print(f"  ins_tok_logits shape: {ins_tok_logits.shape}")
     
-    assert p_del.shape == (B, S)
-    assert p_sub.shape == (B, S)
-    assert p_ins.shape == (B, S + 1)
+    assert del_logits.shape == (B, S)
+    assert sub_logits.shape == (B, S)
+    assert ins_logits.shape == (B, S + 1)
     assert sub_tok_logits.shape == (B, S, vocab_size)
     assert ins_tok_logits.shape == (B, S + 1, vocab_size)
     

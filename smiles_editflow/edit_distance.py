@@ -42,6 +42,83 @@ class EditOp:
         return f"EditOp({self.type})"
 
 
+EPS = "<EPS>"
+
+
+def align_with_epsilon(x0_tokens: List[str], x1_tokens: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Compute a minimal alignment between x0 and x1 with EPS tokens.
+
+    Args:
+        x0_tokens: List of tokens (interior sequence, no BOS/EOS)
+        x1_tokens: List of tokens (interior sequence, no BOS/EOS)
+
+    Returns:
+        (a0, a1) aligned lists of equal length containing tokens or EPS
+    """
+    n = len(x0_tokens)
+    m = len(x1_tokens)
+
+    dp = [[float("inf")] * (m + 1) for _ in range(n + 1)]
+    backptr = [[None] * (m + 1) for _ in range(n + 1)]
+
+    dp[0][0] = 0
+    for i in range(1, n + 1):
+        dp[i][0] = i
+        backptr[i][0] = (i - 1, 0, "DEL")
+    for j in range(1, m + 1):
+        dp[0][j] = j
+        backptr[0][j] = (0, j - 1, "INS")
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if x0_tokens[i - 1] == x1_tokens[j - 1]:
+                cost = dp[i - 1][j - 1]
+                if cost < dp[i][j]:
+                    dp[i][j] = cost
+                    backptr[i][j] = (i - 1, j - 1, "MATCH")
+            else:
+                cost = dp[i - 1][j - 1] + 1
+                if cost < dp[i][j]:
+                    dp[i][j] = cost
+                    backptr[i][j] = (i - 1, j - 1, "SUB")
+
+            cost = dp[i - 1][j] + 1
+            if cost < dp[i][j]:
+                dp[i][j] = cost
+                backptr[i][j] = (i - 1, j, "DEL")
+
+            cost = dp[i][j - 1] + 1
+            if cost < dp[i][j]:
+                dp[i][j] = cost
+                backptr[i][j] = (i, j - 1, "INS")
+
+    a0: List[str] = []
+    a1: List[str] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if backptr[i][j] is None:
+            break
+        prev_i, prev_j, op = backptr[i][j]
+        if op == "MATCH":
+            a0.append(x0_tokens[i - 1])
+            a1.append(x1_tokens[j - 1])
+        elif op == "SUB":
+            a0.append(x0_tokens[i - 1])
+            a1.append(x1_tokens[j - 1])
+        elif op == "DEL":
+            a0.append(x0_tokens[i - 1])
+            a1.append(EPS)
+        elif op == "INS":
+            a0.append(EPS)
+            a1.append(x1_tokens[j - 1])
+        i, j = prev_i, prev_j
+
+    a0.reverse()
+    a1.reverse()
+    return a0, a1
+
+
 def levenshtein_script(src_tokens: List[str], tgt_tokens: List[str]) -> List[EditOp]:
     """
     Compute a minimal Levenshtein edit script from src to tgt.
@@ -116,38 +193,48 @@ def levenshtein_script(src_tokens: List[str], tgt_tokens: List[str]) -> List[Edi
                 dp[i][j] = cost
                 backptr[i][j] = (i, j - 1, EditType.INS)
     
-    # Backtrack to build edit script
-    script = []
+    # Backtrack to build aligned sequences
+    aligned_src = []
+    aligned_tgt = []
     i, j = n, m
     while i > 0 or j > 0:
         if backptr[i][j] is None:
             break
         prev_i, prev_j, op_type = backptr[i][j]
-        
+
         if op_type == EditType.DEL:
-            # Delete from position i (interior), which is i+1 in full sequence (after BOS)
-            full_idx = i  # i-th interior token is at position i in full (1-indexed after BOS)
-            script.append(EditOp(type=EditType.DEL, i=full_idx))
+            aligned_src.append(src_interior[i - 1])
+            aligned_tgt.append(EPS)
         elif op_type == EditType.SUB:
-            # Substitute at position i (interior), which is i+1 in full sequence
-            full_idx = i
-            script.append(EditOp(type=EditType.SUB, i=full_idx, tok=tgt_interior[j - 1]))
+            aligned_src.append(src_interior[i - 1])
+            aligned_tgt.append(tgt_interior[j - 1])
         elif op_type == EditType.INS:
-            # Insert before position i (interior) in src, which corresponds to gap at position i+1 in full
-            # In the full sequence with BOS at 0, interior starts at 1
-            # If we're at interior position i, the gap is after position i in full (before i+1)
-            # Actually, gap g means "insert before token at index g"
-            # Interior position i maps to full position i+1 (since BOS is at 0)
-            # We want to insert to match tgt_interior[j-1]
-            # The gap should be at position i+1 (in full sequence coordinates)
-            gap_idx = i + 1
-            script.append(EditOp(type=EditType.INS, g=gap_idx, tok=tgt_interior[j - 1]))
-        
+            aligned_src.append(EPS)
+            aligned_tgt.append(tgt_interior[j - 1])
+        else:
+            aligned_src.append(src_interior[i - 1])
+            aligned_tgt.append(tgt_interior[j - 1])
+
         i, j = prev_i, prev_j
-    
-    # Reverse to get forward script
-    script.reverse()
-    
+
+    aligned_src.reverse()
+    aligned_tgt.reverse()
+
+    # Build forward script with stable indices
+    script = []
+    full_idx = 1  # start after BOS
+    for s_tok, t_tok in zip(aligned_src, aligned_tgt):
+        if s_tok != EPS and t_tok == EPS:
+            script.append(EditOp(type=EditType.DEL, i=full_idx))
+        elif s_tok == EPS and t_tok != EPS:
+            script.append(EditOp(type=EditType.INS, g=full_idx, tok=t_tok))
+            full_idx += 1
+        elif s_tok != EPS and t_tok != EPS and s_tok != t_tok:
+            script.append(EditOp(type=EditType.SUB, i=full_idx, tok=t_tok))
+            full_idx += 1
+        elif s_tok != EPS and t_tok != EPS and s_tok == t_tok:
+            full_idx += 1
+
     return script
 
 

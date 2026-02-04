@@ -68,6 +68,12 @@ def main():
     parser.add_argument("--device", type=str, default="cpu", help="Device (cpu or cuda)")
     parser.add_argument("--tiny", action="store_true", help="Tiny mode: overfit on 50 molecules")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save model")
+    parser.add_argument("--mode", type=str, default="editflows", choices=["editflows", "teacher_forced"], help="Training mode")
+    parser.add_argument("--aligned-length", type=int, default=160, help="Aligned length N for edit flows")
+    parser.add_argument("--x0-mode", type=str, default="uniform", choices=["uniform", "empty"], help="x0 initialization mode")
+    parser.add_argument("--x0-max-len", type=int, default=32, help="Max length for uniform x0")
+    parser.add_argument("--beta", type=float, default=1e-3, help="Rate regularizer for edit flows")
+    parser.add_argument("--kappa-power", type=int, default=3, help="Power for kappa(t)=t^power")
     
     args = parser.parse_args()
     
@@ -146,6 +152,12 @@ def main():
             vocab_set,
             device=args.device,
             alpha=1.0,
+            mode=args.mode,
+            aligned_length=args.aligned_length,
+            x0_mode=args.x0_mode,
+            x0_max_len=args.x0_max_len,
+            kappa_power=args.kappa_power,
+            beta=args.beta,
         )
         
         # Log
@@ -153,7 +165,7 @@ def main():
             print(f"Step {step:4d} | Loss: {result['loss']:.4f} | "
                   f"DEL: {result['loss_del']:.3f} | SUB: {result['loss_sub']:.3f} | "
                   f"INS: {result['loss_ins']:.3f} | TOK: {result['loss_tok']:.3f} | "
-                  f"EditAcc: {result['edit_type_acc']:.3f} | TokAcc: {result['tok_acc']:.3f}")
+                  f"EditAcc: {result.get('edit_type_acc', 0.0):.3f} | TokAcc: {result.get('tok_acc', 0.0):.3f}")
         
         # Sample molecules
         if (step + 1) % args.sample_every == 0:
@@ -169,7 +181,6 @@ def main():
                     id_to_token,
                     device=args.device,
                     max_steps=30,
-                    sampling_strategy="sample" if step > 100 else "argmax",
                     temperature=1.0,
                     verbose=False,
                 )
@@ -211,7 +222,6 @@ def main():
             id_to_token,
             device=args.device,
             max_steps=40,
-            sampling_strategy="sample",
             temperature=0.8,
             verbose=False,
         )

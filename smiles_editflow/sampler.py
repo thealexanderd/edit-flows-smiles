@@ -1,10 +1,10 @@
-"""Iterative editing sampler for generating SMILES."""
+"""CTMC-style editing sampler for generating SMILES."""
 
+import math
 import torch
-import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-from .tokenizer import BOS, EOS, PAD, encode, decode, detokenize
+from .tokenizer import BOS, EOS, PAD, encode, detokenize
 from .edit_distance import EditOp, EditType, apply_edit
 from .chemistry import is_valid_smiles
 
@@ -14,12 +14,13 @@ def sample_molecule(
     token_to_id: dict,
     id_to_token: dict,
     device: str = "cpu",
-    max_steps: int = 50,
+    max_steps: int = 400,
+    step_size: float = 0.05,
     t_schedule: str = "constant",
     t_value: float = 0.5,
-    sampling_strategy: str = "argmax",
     temperature: float = 1.0,
-    threshold: float = 0.1,
+    stop_threshold: float = 1e-3,
+    stop_patience: int = 5,
     max_retries: int = 3,
     verbose: bool = False,
 ) -> tuple[str, bool, List[str]]:
@@ -51,6 +52,7 @@ def sample_molecule(
     intermediate_smiles = []
     
     with torch.no_grad():
+        low_rate_steps = 0
         for step in range(max_steps):
             # Determine t for this step
             if t_schedule == "linear_decay":
@@ -65,69 +67,54 @@ def sample_molecule(
             t_tensor = torch.tensor([t], dtype=torch.float32, device=device)
             
             # Forward pass
-            p_del, p_sub, p_ins, sub_tok_logits, ins_tok_logits = model(
+            del_logits, sub_logits, ins_logits, sub_tok_logits, ins_tok_logits = model(
                 token_ids, attn_mask, t_tensor
             )
             
             # Extract predictions for single sample
-            p_del = p_del[0].cpu().numpy()  # [S]
-            p_sub = p_sub[0].cpu().numpy()  # [S]
-            p_ins = p_ins[0].cpu().numpy()  # [S+1]
+            del_rates = torch.nn.functional.softplus(del_logits[0]).cpu()  # [S]
+            sub_rates = torch.nn.functional.softplus(sub_logits[0]).cpu()  # [S]
+            ins_rates = torch.nn.functional.softplus(ins_logits[0]).cpu()  # [S+1]
             sub_tok_logits = sub_tok_logits[0].cpu()  # [S, V]
             ins_tok_logits = ins_tok_logits[0].cpu()  # [S+1, V]
             
             S = len(tokens)
             
-            # Build candidate edits with scores
-            candidates = []
-            
-            # Deletion candidates (exclude BOS at 0 and EOS at S-1)
+            candidates: List[Tuple[str, int, float, Optional[torch.Tensor]]] = []
             for i in range(1, S - 1):
-                candidates.append(("DEL", i, p_del[i], None))
-            
-            # Substitution candidates (exclude BOS and EOS)
+                rate = del_rates[i].item()
+                weight = 1.0 - math.exp(-step_size * rate)
+                candidates.append(("DEL", i, weight, None))
             for i in range(1, S - 1):
-                candidates.append(("SUB", i, p_sub[i], sub_tok_logits[i]))
-            
-            # Insertion candidates (gaps between tokens, not before BOS or after EOS)
+                rate = sub_rates[i].item()
+                weight = 1.0 - math.exp(-step_size * rate)
+                candidates.append(("SUB", i, weight, sub_tok_logits[i]))
             for g in range(1, S):
-                candidates.append(("INS", g, p_ins[g], ins_tok_logits[g]))
-            
-            if not candidates:
-                break
-            
-            # Filter by threshold
-            candidates = [(op, pos, score, tok_logits) for op, pos, score, tok_logits in candidates if score > threshold]
-            
-            if not candidates:
-                if verbose:
-                    print(f"Step {step}: No candidates above threshold")
-                break
-            
-            # Sort by score
-            candidates.sort(key=lambda x: x[2], reverse=True)
-            
-            # Select edit
-            if sampling_strategy == "argmax":
-                chosen = candidates[0]
+                rate = ins_rates[g].item()
+                weight = 1.0 - math.exp(-step_size * rate)
+                candidates.append(("INS", g, weight, ins_tok_logits[g]))
+
+            total_rate = sum(c[2] for c in candidates)
+            if total_rate < stop_threshold:
+                low_rate_steps += 1
             else:
-                # Sample proportional to scores
-                scores = np.array([c[2] for c in candidates])
-                scores = scores / temperature
-                probs = np.exp(scores) / np.exp(scores).sum()
-                idx = np.random.choice(len(candidates), p=probs)
-                chosen = candidates[idx]
-            
-            op_type, pos, score, tok_logits = chosen
-            
-            # Sample token if needed
-            if op_type == "SUB" or op_type == "INS":
-                if sampling_strategy == "argmax":
-                    tok_id = tok_logits.argmax().item()
-                else:
-                    tok_probs = torch.softmax(tok_logits / temperature, dim=0)
-                    tok_id = torch.multinomial(tok_probs, 1).item()
-                
+                low_rate_steps = 0
+            if low_rate_steps >= stop_patience:
+                if verbose:
+                    print(f"Step {step}: stopping due to low total rate")
+                break
+
+            if total_rate <= 0:
+                break
+
+            weights = torch.tensor([c[2] for c in candidates], dtype=torch.float32)
+            probs = weights / weights.sum()
+            idx = torch.multinomial(probs, 1).item()
+            op_type, pos, score, tok_logits = candidates[idx]
+
+            if op_type in {"SUB", "INS"}:
+                tok_probs = torch.softmax(tok_logits / temperature, dim=0)
+                tok_id = torch.multinomial(tok_probs, 1).item()
                 tok = id_to_token[tok_id]
             else:
                 tok = None
@@ -148,18 +135,20 @@ def sample_molecule(
             is_valid = is_valid_smiles(smiles_candidate)
             
             if verbose:
-                print(f"Step {step}: {op_type} at {pos} (score={score:.3f}) -> {smiles_candidate} (valid={is_valid})")
+                print(f"Step {step}: {op_type} at {pos} (rate={score:.3f}) -> {smiles_candidate} (valid={is_valid})")
             
             if not is_valid:
-                # Try next candidate
+                # Try next candidates by descending rate
                 retry_count = 0
                 found_valid = False
-                for alt_idx in range(1, min(len(candidates), max_retries + 1)):
-                    alt_op_type, alt_pos, alt_score, alt_tok_logits = candidates[alt_idx]
+                alt_candidates = sorted(candidates, key=lambda x: x[2], reverse=True)
+                for alt_idx in range(1, min(len(alt_candidates), max_retries + 1)):
+                    alt_op_type, alt_pos, alt_score, alt_tok_logits = alt_candidates[alt_idx]
                     
                     # Sample token if needed
                     if alt_op_type in ["SUB", "INS"]:
-                        alt_tok_id = alt_tok_logits.argmax().item()
+                        tok_probs = torch.softmax(alt_tok_logits / temperature, dim=0)
+                        alt_tok_id = torch.multinomial(tok_probs, 1).item()
                         alt_tok = id_to_token[alt_tok_id]
                     else:
                         alt_tok = None
@@ -192,10 +181,7 @@ def sample_molecule(
             tokens = new_tokens
             intermediate_smiles.append(smiles_candidate)
             
-            # Early stopping if valid and reasonable length
-            if is_valid and len(tokens) > 5:
-                # Could add more stopping criteria here
-                pass
+            # Optional: continue editing even if valid to refine
         
     # Final SMILES
     final_smiles = detokenize(tokens)

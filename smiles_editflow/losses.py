@@ -6,7 +6,28 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 
 
-def compute_losses(
+def _build_valid_masks(attn_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build valid masks for DEL/SUB positions and INS gaps."""
+    B, S = attn_mask.shape
+    device = attn_mask.device
+
+    valid_del_sub = attn_mask.clone()
+    valid_ins = torch.zeros(B, S + 1, dtype=torch.bool, device=device)
+
+    for b in range(B):
+        valid_positions = attn_mask[b].nonzero(as_tuple=True)[0]
+        if len(valid_positions) > 0:
+            valid_del_sub[b, 0] = False
+            last_valid = valid_positions[-1]
+            valid_del_sub[b, last_valid] = False
+
+            first_valid = valid_positions[0].item()
+            valid_ins[b, first_valid + 1:last_valid + 1] = True
+
+    return valid_del_sub, valid_ins
+
+
+def compute_losses_teacher_forced(
     p_del: torch.Tensor,
     p_sub: torch.Tensor,
     p_ins: torch.Tensor,
@@ -22,158 +43,84 @@ def compute_losses(
     pad_id: int,
     alpha: float = 1.0,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Compute masked losses for edit operations.
-    
-    Args:
-        p_del: [B, S] deletion probabilities
-        p_sub: [B, S] substitution probabilities
-        p_ins: [B, S+1] insertion probabilities
-        sub_tok_logits: [B, S, V] substitution token logits
-        ins_tok_logits: [B, S+1, V] insertion token logits
-        y_del: [B, S] deletion targets
-        y_sub: [B, S] substitution targets
-        y_ins: [B, S+1] insertion targets
-        tok_targets: List of (type, pos, tok_id) or None for each batch item
-        attn_mask: [B, S] attention mask (True for real tokens)
-        bos_id: BOS token ID
-        eos_id: EOS token ID
-        pad_id: PAD token ID
-        alpha: Weight for token loss
-        
-    Returns:
-        Dictionary of losses and metrics
-    """
+    """Compute masked BCE/CE losses for teacher-forced supervision."""
     B, S = p_del.shape
     device = p_del.device
-    
-    # Create masks for valid positions
-    # For DEL/SUB: exclude BOS, EOS, and PAD
-    token_ids = torch.zeros(B, S, dtype=torch.long, device=device)  # Dummy for now
-    
-    # Valid mask for DEL/SUB: not BOS, not EOS, not PAD
-    valid_del_sub = attn_mask.clone()  # Start with attention mask
-    
-    # We need to identify BOS/EOS positions
-    # Assume BOS is always at position 0 and EOS is at the last valid position
-    for b in range(B):
-        valid_del_sub[b, 0] = False  # Mask BOS
-        # Find last valid position (EOS)
-        valid_positions = attn_mask[b].nonzero(as_tuple=True)[0]
-        if len(valid_positions) > 0:
-            last_valid = valid_positions[-1]
-            valid_del_sub[b, last_valid] = False  # Mask EOS
-    
-    # Valid mask for INS: gaps between valid tokens (1 to S-1)
-    # Gap 0 (before BOS) and gap S (after EOS) should be masked
-    valid_ins = torch.zeros(B, S + 1, dtype=torch.bool, device=device)
-    for b in range(B):
-        valid_positions = attn_mask[b].nonzero(as_tuple=True)[0]
-        if len(valid_positions) > 0:
-            first_valid = valid_positions[0].item()
-            last_valid = valid_positions[-1].item()
-            # Valid gaps are from first_valid+1 to last_valid (inclusive)
-            # These are gaps AFTER BOS and BEFORE/AT EOS position
-            valid_ins[b, first_valid + 1:last_valid + 1] = True
-    
-    # BCE loss for DEL
+
+    valid_del_sub, valid_ins = _build_valid_masks(attn_mask)
+
     loss_del = F.binary_cross_entropy(
         p_del[valid_del_sub],
         y_del[valid_del_sub],
-        reduction='mean'
+        reduction="mean",
     )
-    
-    # BCE loss for SUB
     loss_sub = F.binary_cross_entropy(
         p_sub[valid_del_sub],
         y_sub[valid_del_sub],
-        reduction='mean'
+        reduction="mean",
     )
-    
-    # BCE loss for INS
     loss_ins = F.binary_cross_entropy(
         p_ins[valid_ins],
         y_ins[valid_ins],
-        reduction='mean'
+        reduction="mean",
     )
-    
-    # Token CE loss
+
     loss_tok = torch.tensor(0.0, device=device)
     tok_correct = 0
     tok_total = 0
-    
+
     for b, tok_target in enumerate(tok_targets):
         if tok_target is not None:
             op_type, pos, tok_id = tok_target
-            
-            if op_type == "SUB":
-                if pos < S:
-                    logits = sub_tok_logits[b, pos]
-                    loss_tok = loss_tok + F.cross_entropy(
-                        logits.unsqueeze(0),
-                        torch.tensor([tok_id], device=device),
-                        reduction='sum'
-                    )
-                    pred_id = logits.argmax().item()
-                    if pred_id == tok_id:
-                        tok_correct += 1
-                    tok_total += 1
-                    
-            elif op_type == "INS":
-                if pos <= S:
-                    logits = ins_tok_logits[b, pos]
-                    loss_tok = loss_tok + F.cross_entropy(
-                        logits.unsqueeze(0),
-                        torch.tensor([tok_id], device=device),
-                        reduction='sum'
-                    )
-                    pred_id = logits.argmax().item()
-                    if pred_id == tok_id:
-                        tok_correct += 1
-                    tok_total += 1
-    
+            if op_type == "SUB" and pos < S:
+                logits = sub_tok_logits[b, pos]
+                loss_tok = loss_tok + F.cross_entropy(
+                    logits.unsqueeze(0),
+                    torch.tensor([tok_id], device=device),
+                    reduction="sum",
+                )
+                pred_id = logits.argmax().item()
+                tok_correct += int(pred_id == tok_id)
+                tok_total += 1
+            elif op_type == "INS" and pos <= S:
+                logits = ins_tok_logits[b, pos]
+                loss_tok = loss_tok + F.cross_entropy(
+                    logits.unsqueeze(0),
+                    torch.tensor([tok_id], device=device),
+                    reduction="sum",
+                )
+                pred_id = logits.argmax().item()
+                tok_correct += int(pred_id == tok_id)
+                tok_total += 1
+
     if tok_total > 0:
         loss_tok = loss_tok / tok_total
         tok_accuracy = tok_correct / tok_total
     else:
         tok_accuracy = 0.0
-    
-    # Total loss
+
     total_loss = loss_del + loss_sub + loss_ins + alpha * loss_tok
-    
-    # Compute accuracies for edit type
-    # Predict edit type: argmax over [p_del, p_sub, p_ins] for each valid position
-    edit_type_correct = 0
+
+    edit_type_accuracy = 0.0
     edit_type_total = 0
-    
     for b in range(B):
-        # Check if any target is active
         if y_del[b].sum() > 0 or y_sub[b].sum() > 0 or y_ins[b].sum() > 0:
-            # Find the active target
             del_active = y_del[b].argmax()
             sub_active = y_sub[b].argmax()
             ins_active = y_ins[b].argmax()
-            
-            # Determine ground truth edit type
             if y_del[b, del_active] > 0.5:
-                gt_type = 0  # DEL
-                # Check if model predicts DEL at that position
                 if p_del[b, del_active] > p_sub[b, del_active]:
-                    edit_type_correct += 1
+                    edit_type_accuracy += 1
             elif y_sub[b, sub_active] > 0.5:
-                gt_type = 1  # SUB
                 if p_sub[b, sub_active] > p_del[b, sub_active]:
-                    edit_type_correct += 1
+                    edit_type_accuracy += 1
             elif y_ins[b, ins_active] > 0.5:
-                gt_type = 2  # INS
-                # For INS, just check if p_ins is highest at that gap
                 if ins_active < len(p_ins[b]) and p_ins[b, ins_active] > 0.5:
-                    edit_type_correct += 1
-            
+                    edit_type_accuracy += 1
             edit_type_total += 1
-    
-    edit_type_accuracy = edit_type_correct / edit_type_total if edit_type_total > 0 else 0.0
-    
+
+    edit_type_accuracy = edit_type_accuracy / edit_type_total if edit_type_total > 0 else 0.0
+
     return {
         "loss": total_loss,
         "loss_del": loss_del,
@@ -181,6 +128,112 @@ def compute_losses(
         "loss_ins": loss_ins,
         "loss_tok": loss_tok,
         "edit_type_acc": edit_type_accuracy,
+        "tok_acc": tok_accuracy,
+    }
+
+
+def compute_losses_editflows(
+    del_rates: torch.Tensor,
+    sub_rates: torch.Tensor,
+    ins_rates: torch.Tensor,
+    sub_tok_logits: torch.Tensor,
+    ins_tok_logits: torch.Tensor,
+    del_targets: List[List[int]],
+    sub_targets: List[List[Tuple[int, int]]],
+    ins_targets: List[List[Tuple[int, int]]],
+    attn_mask: torch.Tensor,
+    bos_id: int,
+    eos_id: int,
+    pad_id: int,
+    beta: float = 1e-3,
+    t_weight: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> Dict[str, torch.Tensor]:
+    """Compute Edit Flows rate-based loss with CTMC-inspired objective."""
+    B, S = del_rates.shape
+    device = del_rates.device
+
+    valid_del_sub, valid_ins = _build_valid_masks(attn_mask)
+
+    loss_del_total = torch.tensor(0.0, device=device)
+    loss_sub_total = torch.tensor(0.0, device=device)
+    loss_ins_total = torch.tensor(0.0, device=device)
+    loss_tok_total = torch.tensor(0.0, device=device)
+    tok_correct = 0
+    tok_total = 0
+
+    for b in range(B):
+        w = t_weight[b] if t_weight is not None else 1.0
+
+        del_rate_b = del_rates[b]
+        sub_rate_b = sub_rates[b]
+        ins_rate_b = ins_rates[b]
+
+        del_targets_b = del_targets[b]
+        if del_targets_b:
+            del_idx = torch.tensor(del_targets_b, device=device, dtype=torch.long)
+            lpos = -torch.log(del_rate_b[del_idx] + eps).sum()
+        else:
+            lpos = torch.tensor(0.0, device=device)
+        lneg = beta * del_rate_b[valid_del_sub[b]].sum()
+        loss_del_total = loss_del_total + w * (lpos + lneg)
+
+        sub_targets_b = sub_targets[b]
+        if sub_targets_b:
+            sub_idx = torch.tensor([p for p, _ in sub_targets_b], device=device, dtype=torch.long)
+            lpos = -torch.log(sub_rate_b[sub_idx] + eps).sum()
+        else:
+            lpos = torch.tensor(0.0, device=device)
+        lneg = beta * sub_rate_b[valid_del_sub[b]].sum()
+        loss_sub_total = loss_sub_total + w * (lpos + lneg)
+
+        ins_targets_b = ins_targets[b]
+        if ins_targets_b:
+            ins_idx = torch.tensor([g for g, _ in ins_targets_b], device=device, dtype=torch.long)
+            lpos = -torch.log(ins_rate_b[ins_idx] + eps).sum()
+        else:
+            lpos = torch.tensor(0.0, device=device)
+        lneg = beta * ins_rate_b[valid_ins[b]].sum()
+        loss_ins_total = loss_ins_total + w * (lpos + lneg)
+
+        for pos, tok_id in sub_targets_b:
+            if pos < S:
+                logits = sub_tok_logits[b, pos]
+                loss_tok_total = loss_tok_total + w * F.cross_entropy(
+                    logits.unsqueeze(0),
+                    torch.tensor([tok_id], device=device),
+                    reduction="sum",
+                )
+                pred_id = logits.argmax().item()
+                tok_correct += int(pred_id == tok_id)
+                tok_total += 1
+
+        for gap, tok_id in ins_targets_b:
+            if gap <= S:
+                logits = ins_tok_logits[b, gap]
+                loss_tok_total = loss_tok_total + w * F.cross_entropy(
+                    logits.unsqueeze(0),
+                    torch.tensor([tok_id], device=device),
+                    reduction="sum",
+                )
+                pred_id = logits.argmax().item()
+                tok_correct += int(pred_id == tok_id)
+                tok_total += 1
+
+    total_loss = (loss_del_total + loss_sub_total + loss_ins_total + loss_tok_total) / B
+    loss_del = loss_del_total / B
+    loss_sub = loss_sub_total / B
+    loss_ins = loss_ins_total / B
+    loss_tok = loss_tok_total / B
+    tok_accuracy = tok_correct / tok_total if tok_total > 0 else 0.0
+
+    return {
+        "loss": total_loss,
+        "loss_del": loss_del,
+        "loss_sub": loss_sub,
+        "loss_ins": loss_ins,
+        "loss_tok": loss_tok,
+        "edit_type_acc": 0.0,
         "tok_acc": tok_accuracy,
     }
 
@@ -216,7 +269,7 @@ if __name__ == "__main__":
     
     attn_mask = torch.ones(B, S, dtype=torch.bool)
     
-    losses = compute_losses(
+    losses = compute_losses_teacher_forced(
         p_del, p_sub, p_ins,
         sub_tok_logits, ins_tok_logits,
         y_del, y_sub, y_ins,
