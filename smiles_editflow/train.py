@@ -68,7 +68,6 @@ def main():
     parser.add_argument("--device", type=str, default="cpu", help="Device (cpu or cuda)")
     parser.add_argument("--tiny", action="store_true", help="Tiny mode: overfit on 50 molecules")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save model")
-    parser.add_argument("--mode", type=str, default="editflows", choices=["editflows", "teacher_forced"], help="Training mode")
     parser.add_argument("--aligned-length", type=int, default=160, help="Aligned length N for edit flows")
     parser.add_argument("--x0-mode", type=str, default="uniform", choices=["uniform", "empty"], help="x0 initialization mode")
     parser.add_argument("--x0-max-len", type=int, default=32, help="Max length for uniform x0")
@@ -151,8 +150,6 @@ def main():
             id_to_token,
             vocab_set,
             device=args.device,
-            alpha=1.0,
-            mode=args.mode,
             aligned_length=args.aligned_length,
             x0_mode=args.x0_mode,
             x0_max_len=args.x0_max_len,

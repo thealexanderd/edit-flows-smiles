@@ -30,17 +30,20 @@ result = apply_script(src, script)
 assert result == tgt, "Edit script application failed"
 print("   ✓ Edit distance working correctly")
 
-# Test 3: Corruption
-print("\n3. Testing corruption...")
-from smiles_editflow.corruption import corrupt
-import random
+# Test 3: Alignment + targets
+print("\n3. Testing alignment and targets...")
+from smiles_editflow.alignment import make_alignment_fixed_N, sample_z_t, strip_epsilon, extract_targets
+from smiles_editflow.edit_distance import align_with_epsilon
 
-tokens = add_special(tokenize("CCO"))
-vocab = {"C", "N", "O", "S", "P"}
-x_t = corrupt(tokens, t=0.5, vocab=vocab, rng=random.Random(42))
-assert len(x_t) >= 2, "Corruption failed"
-assert x_t[0] == BOS and x_t[-1] == EOS, "BOS/EOS not preserved"
-print("   ✓ Corruption working correctly")
+x0 = ["C", "C"]
+x1 = ["C", "O", "C"]
+a0, a1 = align_with_epsilon(x0, x1)
+z0, z1 = make_alignment_fixed_N(a0, a1, len(a0))
+z_t = sample_z_t(z0, z1, t=0.0, kappa=lambda u: u ** 3)
+assert strip_epsilon(z_t) == x0
+del_pos, sub_pairs, ins_pairs = extract_targets(z_t, z1)
+assert len(del_pos) + len(sub_pairs) + len(ins_pairs) == len(levenshtein_script(add_special(x0), add_special(x1)))
+print("   ✓ Alignment and target extraction working correctly")
 
 # Test 4: Model forward pass
 print("\n4. Testing model...")
@@ -77,6 +80,6 @@ print("   ✓ Training step working correctly")
 print("\n" + "=" * 60)
 print("All tests passed! ✓")
 print("=" * 60)
-print("\nThe implementation is ready to use.")
+print("\nThe implementation is ready to use (Edit Flows mode).")
 print("\nTo run training:")
 print("  python3 smiles_editflow/train.py --tiny")

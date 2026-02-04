@@ -34,7 +34,6 @@ def test_editflows_training_step_runs():
         id_to_token,
         vocab_set,
         device="cpu",
-        mode="editflows",
         aligned_length=32,
         x0_mode="uniform",
         x0_max_len=6,

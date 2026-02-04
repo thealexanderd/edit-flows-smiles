@@ -1,8 +1,12 @@
 """Tests for epsilon-alignment utilities."""
 
+import random
+
 from smiles_editflow.alignment import EPS, strip_epsilon, make_alignment_fixed_N, sample_z_t, extract_targets
 from smiles_editflow.edit_distance import align_with_epsilon, levenshtein_script
-from smiles_editflow.tokenizer import add_special
+from smiles_editflow.tokenizer import add_special, build_vocab, BOS, EOS, PAD, UNK, tokenize
+from smiles_editflow.chemistry import canonicalize_smiles, randomized_smiles
+from smiles_editflow.train_step import prepare_training_batch, kappa, sample_t_open_interval
 
 
 def test_strip_epsilon():
@@ -47,3 +51,112 @@ def test_sample_z_t_endpoints():
 
     assert z_t0 == z0
     assert z_t1 == z1
+
+
+def test_extract_targets_mapping():
+    z_t = ["C", EPS, "O", "N", EPS, "S"]
+    z1 = ["C", "F", EPS, "N", "P", "S"]
+
+    del_pos, sub_pairs, ins_pairs = extract_targets(z_t, z1)
+
+    assert del_pos == [1]
+    assert sub_pairs == []
+    assert ins_pairs == [(1, "F"), (3, "P")]
+
+
+def test_prepare_training_batch_bos_shift_inserts():
+    smiles_list = ["CC"]
+    token_to_id, id_to_token = build_vocab(smiles_list)
+    vocab_set = set(token_to_id.keys())
+
+    seed = 123
+    aligned_length = 8
+    t_min = 0.5
+    t_max = 0.5
+
+    batch = prepare_training_batch(
+        smiles_list,
+        token_to_id,
+        id_to_token,
+        vocab_set,
+        t_min=t_min,
+        t_max=t_max,
+        seed=seed,
+        aligned_length=aligned_length,
+        x0_mode="empty",
+        x0_max_len=3,
+        kappa_power=3,
+    )
+
+    rng = random.Random(seed)
+    canonical = canonicalize_smiles(smiles_list[0])
+    randomized = randomized_smiles(canonical) or canonical
+    tokens = tokenize(randomized)
+    t = sample_t_open_interval(rng, t_min, t_max)
+
+    a0, a1 = align_with_epsilon([], tokens)
+    z0, z1 = make_alignment_fixed_N(a0, a1, aligned_length, rng)
+    z_t = sample_z_t(z0, z1, t, lambda u: kappa(u, 3), rng)
+
+    del_pos, sub_pairs, ins_pairs = extract_targets(z_t, z1)
+    expected_del = [i + 1 for i in del_pos]
+    expected_sub = [(i + 1, token_to_id.get(tok, token_to_id.get(UNK))) for i, tok in sub_pairs]
+    expected_ins = [(g + 1, token_to_id.get(tok, token_to_id.get(UNK))) for g, tok in ins_pairs]
+
+    assert batch["del_targets"][0] == expected_del
+    assert batch["sub_targets"][0] == expected_sub
+    assert batch["ins_targets"][0] == expected_ins
+
+
+def test_prepare_training_batch_bos_shift_deletes():
+    smiles_list = ["C"]
+    token_to_id, id_to_token = build_vocab(smiles_list)
+    vocab_set = set(token_to_id.keys())
+
+    seed = 0
+    aligned_length = 8
+    t_min = 0.5
+    t_max = 0.5
+
+    batch = prepare_training_batch(
+        smiles_list,
+        token_to_id,
+        id_to_token,
+        vocab_set,
+        t_min=t_min,
+        t_max=t_max,
+        seed=seed,
+        aligned_length=aligned_length,
+        x0_mode="uniform",
+        x0_max_len=3,
+        kappa_power=3,
+    )
+
+    rng = random.Random(seed)
+    canonical = canonicalize_smiles(smiles_list[0])
+    randomized = randomized_smiles(canonical) or canonical
+    tokens = tokenize(randomized)
+    t = sample_t_open_interval(rng, t_min, t_max)
+
+    vocab_tokens = [
+        tok for tok in vocab_set
+        if tok not in {BOS, EOS, PAD, UNK}
+    ]
+    L0 = rng.randint(0, 3)
+    if vocab_tokens:
+        x0_tokens = [rng.choice(vocab_tokens) for _ in range(L0)]
+    else:
+        x0_tokens = []
+
+    a0, a1 = align_with_epsilon(x0_tokens, tokens)
+    z0, z1 = make_alignment_fixed_N(a0, a1, aligned_length, rng)
+    z_t = sample_z_t(z0, z1, t, lambda u: kappa(u, 3), rng)
+
+    del_pos, sub_pairs, ins_pairs = extract_targets(z_t, z1)
+    expected_del = [i + 1 for i in del_pos]
+    expected_sub = [(i + 1, token_to_id.get(tok, token_to_id.get(UNK))) for i, tok in sub_pairs]
+    expected_ins = [(g + 1, token_to_id.get(tok, token_to_id.get(UNK))) for g, tok in ins_pairs]
+
+    assert batch["del_targets"][0] == expected_del
+    assert batch["sub_targets"][0] == expected_sub
+    assert batch["ins_targets"][0] == expected_ins

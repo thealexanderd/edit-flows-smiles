@@ -1,16 +1,17 @@
 # SMILES Edit Flow
 
-A sequence-editing pretraining pipeline for SMILES strings, inspired by the concept of "editing as a generative process". This implementation trains a transformer model to predict edit operations (insert, delete, substitute) that progressively refine corrupted molecular sequences toward valid target structures.
+A sequence-editing pretraining pipeline for SMILES strings, inspired by the concept of "editing as a generative process". This implementation trains a transformer model to predict edit operations (insert, delete, substitute) that progressively refine intermediate sequences toward valid target structures.
 
 ## Overview
 
-Unlike traditional next-token language models, this model learns a **policy over edit operations**. Given a partially corrupted SMILES sequence `x_t` and a scalar corruption level `t ∈ (0,1)`, the model predicts the next edit operation that moves `x_t` closer to a valid target molecule.
+Unlike traditional next-token language models, this model learns a **policy over edit operations**. Given an intermediate sequence `x_t` sampled from an epsilon-aligned mixture of `x0` and `x1` and a scalar time `t ∈ (0,1)`, the model predicts edit **rates** and token distributions for insertions, deletions, and substitutions.
 
 ### Key Features
 
 - **SMILES-aware tokenization**: Handles bracket expressions, multi-digit ring closures, stereochemistry, and two-character atoms
 - **Edit-based generation**: Models molecular generation as iterative sequence editing
-- **Levenshtein-based supervision**: Uses minimal edit scripts for training targets
+- **Epsilon alignment supervision**: Builds multi-target edits from aligned `(x0, x1)` pairs
+- **Rate-based training**: Learns CTMC-style edit rates with position and token heads
 - **Transformer architecture**: Policy network with specialized heads for delete/substitute/insert operations
 - **No third-party dependencies**: Rule-based tokenizer implemented from scratch
 
@@ -21,14 +22,16 @@ smiles_editflow/
     __init__.py          # Package initialization
     tokenizer.py         # SMILES tokenization and vocabulary
     chemistry.py         # RDKit utilities for validation
-    corruption.py        # Sequence corruption for x_t generation
+    corruption.py        # Legacy corruption utilities (teacher-forced)
     edit_distance.py     # Levenshtein distance and edit scripts
     targets.py           # Training target construction
     model.py             # Transformer encoder policy network
-    losses.py            # Masked BCE and CE loss functions
+    masking.py           # Token logit masking utilities
+    losses.py            # Rate-based losses (plus legacy teacher-forced)
     train_step.py        # Training step logic
     sampler.py           # Iterative editing sampler
     train.py             # Main training script
+    legacy/teacher_forced.py # Deprecated teacher-forced pipeline
 
 tests/
     test_tokenizer.py    # Tokenizer unit tests
@@ -116,6 +119,11 @@ python smiles_editflow/train.py \
 - `--device`: Device to use (`cpu` or `cuda`)
 - `--tiny`: Use tiny mode for quick testing
 - `--save-dir`: Directory to save model checkpoints (default: `checkpoints`)
+- `--aligned-length`: Aligned length `N` for epsilon alignment (default: 160)
+- `--x0-mode`: Source init mode (`uniform` or `empty`)
+- `--x0-max-len`: Max length for uniform `x0`
+- `--beta`: Rate regularizer for Edit Flows
+- `--kappa-power`: Power for `kappa(t) = t^power`
 
 ### Expected Output
 
@@ -183,19 +191,23 @@ reconstructed = detokenize(tokens)
 # 'C[NH3+]%10CCC%10'
 ```
 
-### Corruption Process
+### Alignment and z_t Sampling
 
-Given a target sequence `x1`, create corrupted `x_t`:
+Given a source sequence `x0` and target `x1`, build epsilon-aligned pairs and sample `z_t`:
 
 ```python
-from smiles_editflow.corruption import corrupt
-from smiles_editflow.tokenizer import add_special
+from smiles_editflow.edit_distance import align_with_epsilon
+from smiles_editflow.alignment import make_alignment_fixed_N, sample_z_t, strip_epsilon
+from smiles_editflow.train_step import kappa
+from smiles_editflow.tokenizer import tokenize
 
-tokens = add_special(tokenize("CCO"))  # [BOS, C, C, O, EOS]
-vocab = {"C", "N", "O", "S", "P"}
+x0 = ["C"]  # example source
+x1 = tokenize("CCO")
 
-x_t = corrupt(tokens, t=0.5, vocab=vocab, rng=random.Random(42))
-# Example: [BOS, C, N, EOS] (deleted O, substituted C->N)
+a0, a1 = align_with_epsilon(x0, x1)
+z0, z1 = make_alignment_fixed_N(a0, a1, N=8)
+z_t = sample_z_t(z0, z1, t=0.5, kappa=lambda u: kappa(u, 3))
+x_t = strip_epsilon(z_t)
 ```
 
 ### Edit Operations
@@ -217,9 +229,9 @@ Token Embedding + Positional Encoding + Time Embedding
   ↓
 Transformer Encoder (N layers)
   ↓
-  ├─→ Delete head: p_del [B, S]
-  ├─→ Substitute head: p_sub [B, S], sub_tok_logits [B, S, V]
-  └─→ Insert head: p_ins [B, S+1], ins_tok_logits [B, S+1, V]
+  ├─→ Delete head: λ_del [B, S]
+  ├─→ Substitute head: λ_sub [B, S], sub_tok_logits [B, S, V]
+  └─→ Insert head: λ_ins [B, S+1], ins_tok_logits [B, S+1, V]
 ```
 
 ### Training Objective
@@ -228,11 +240,12 @@ For each training example:
 
 1. Canonicalize and randomize SMILES (augmentation)
 2. Tokenize to get `x1`
-3. Sample corruption level `t ~ Uniform(0.05, 0.95)`
-4. Corrupt to get `x_t`
-5. Compute minimal edit script from `x_t` to `x1`
-6. Take **first edit** as supervision (teacher forcing)
-7. Train with masked BCE + CE losses
+3. Sample `x0` (empty or random tokens)
+4. Compute epsilon alignment `(a0, a1)` and pad to fixed length `N`
+5. Sample `t` in `(0,1)` and draw `z_t` via `kappa(t) = t^3`
+6. Strip epsilons to get `x_t`
+7. Extract multiple edit targets from `(z_t, z1)`
+8. Train with rate-based loss: `-log λ` on targets + `beta * sum λ` + token CE, weighted by `w(t) = dκ/dt`
 
 ### Sampling Process
 
@@ -246,21 +259,20 @@ smiles, is_valid, intermediates = sample_molecule(
     token_to_id,
     id_to_token,
     max_steps=50,
-    sampling_strategy="sample",  # or "argmax"
     temperature=1.0,
     verbose=True
 )
 ```
 
-Starting from `[BOS, EOS]`, the model iteratively applies edits until convergence or max steps.
+Starting from `[BOS, EOS]`, the model iteratively samples a single edit proportional to the predicted rates until convergence or max steps.
 
 ## Limitations and Future Work
 
 Current implementation:
 
 - ✅ Handles complex SMILES tokenization
-- ✅ Levenshtein-based supervision
-- ✅ Masked loss computation
+- ✅ Epsilon alignment supervision
+- ✅ Rate-based loss computation
 - ✅ Iterative sampling with validity checking
 - ⚠️ Small models (for demonstration)
 - ⚠️ Simple time scheduling
@@ -268,8 +280,7 @@ Current implementation:
 Potential improvements:
 
 - Larger models and datasets
-- Better time scheduling strategies
-- Multi-step training (predict multiple edits)
+- Richer time scheduling strategies
 - Curriculum learning (easier molecules first)
 - Property-conditional generation
 - Reinforcement learning fine-tuning

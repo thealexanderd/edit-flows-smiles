@@ -1,7 +1,6 @@
 """Loss functions for training the edit flow model."""
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 
@@ -154,6 +153,13 @@ def compute_losses_editflows(
     device = del_rates.device
 
     valid_del_sub, valid_ins = _build_valid_masks(attn_mask)
+    valid_del_sub_f = valid_del_sub.float()
+    valid_ins_f = valid_ins.float()
+
+    # Zero out invalid positions (BOS/EOS/PAD and invalid gaps) in all rate tensors.
+    del_rates = del_rates * valid_del_sub_f
+    sub_rates = sub_rates * valid_del_sub_f
+    ins_rates = ins_rates * valid_ins_f
 
     loss_del_total = torch.tensor(0.0, device=device)
     loss_sub_total = torch.tensor(0.0, device=device)

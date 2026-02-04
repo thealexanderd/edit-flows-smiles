@@ -1,12 +1,12 @@
 """CTMC-style editing sampler for generating SMILES."""
 
-import math
 import torch
 from typing import List, Optional, Tuple
 
 from .tokenizer import BOS, EOS, PAD, encode, detokenize
 from .edit_distance import EditOp, EditType, apply_edit
 from .chemistry import is_valid_smiles
+from .masking import mask_token_logits
 
 
 def sample_molecule(
@@ -15,7 +15,6 @@ def sample_molecule(
     id_to_token: dict,
     device: str = "cpu",
     max_steps: int = 400,
-    step_size: float = 0.05,
     t_schedule: str = "constant",
     t_value: float = 0.5,
     temperature: float = 1.0,
@@ -35,9 +34,8 @@ def sample_molecule(
         max_steps: Maximum number of editing steps
         t_schedule: Time schedule ("constant" or "linear_decay")
         t_value: Time value for constant schedule
-        sampling_strategy: "argmax" or "sample"
         temperature: Temperature for sampling
-        threshold: Minimum score to continue editing
+        stop_threshold: Minimum total rate to continue editing
         max_retries: Max retries for invalid edits
         verbose: Print intermediate steps
         
@@ -77,22 +75,23 @@ def sample_molecule(
             ins_rates = torch.nn.functional.softplus(ins_logits[0]).cpu()  # [S+1]
             sub_tok_logits = sub_tok_logits[0].cpu()  # [S, V]
             ins_tok_logits = ins_tok_logits[0].cpu()  # [S+1, V]
+
+            forbidden_ids = [token_to_id[BOS], token_to_id[EOS], token_to_id[PAD]]
+            sub_tok_logits = mask_token_logits(sub_tok_logits, forbidden_ids)
+            ins_tok_logits = mask_token_logits(ins_tok_logits, forbidden_ids)
             
             S = len(tokens)
             
             candidates: List[Tuple[str, int, float, Optional[torch.Tensor]]] = []
             for i in range(1, S - 1):
                 rate = del_rates[i].item()
-                weight = 1.0 - math.exp(-step_size * rate)
-                candidates.append(("DEL", i, weight, None))
+                candidates.append(("DEL", i, rate, None))
             for i in range(1, S - 1):
                 rate = sub_rates[i].item()
-                weight = 1.0 - math.exp(-step_size * rate)
-                candidates.append(("SUB", i, weight, sub_tok_logits[i]))
+                candidates.append(("SUB", i, rate, sub_tok_logits[i]))
             for g in range(1, S):
                 rate = ins_rates[g].item()
-                weight = 1.0 - math.exp(-step_size * rate)
-                candidates.append(("INS", g, weight, ins_tok_logits[g]))
+                candidates.append(("INS", g, rate, ins_tok_logits[g]))
 
             total_rate = sum(c[2] for c in candidates)
             if total_rate < stop_threshold:

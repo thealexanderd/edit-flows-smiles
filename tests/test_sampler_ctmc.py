@@ -22,7 +22,6 @@ def test_ctmc_sampler_runs():
         id_to_token,
         device="cpu",
         max_steps=5,
-        step_size=0.05,
         verbose=False,
     )
 
