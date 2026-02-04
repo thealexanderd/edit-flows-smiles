@@ -1,10 +1,9 @@
 """CTMC-style editing sampler for generating SMILES."""
 
 import torch
-from typing import List, Optional, Tuple
+from typing import List
 
-from .tokenizer import BOS, EOS, PAD, encode, detokenize
-from .edit_distance import EditOp, EditType, apply_edit
+from .tokenizer import BOS, EOS, PAD, UNK, encode, detokenize
 from .chemistry import is_valid_smiles
 from .masking import mask_token_logits
 
@@ -15,7 +14,8 @@ def sample_molecule(
     id_to_token: dict,
     device: str = "cpu",
     max_steps: int = 400,
-    t_schedule: str = "constant",
+    step_size: float = 0.05,
+    t_schedule: str = "ctmc",
     t_value: float = 0.5,
     temperature: float = 1.0,
     stop_threshold: float = 1e-3,
@@ -32,7 +32,8 @@ def sample_molecule(
         id_to_token: ID to token mapping
         device: Device to run on
         max_steps: Maximum number of editing steps
-        t_schedule: Time schedule ("constant" or "linear_decay")
+        step_size: Step size h for CTMC simulation
+        t_schedule: Time schedule ("ctmc", "constant", or "linear_decay")
         t_value: Time value for constant schedule
         temperature: Temperature for sampling
         stop_threshold: Minimum total rate to continue editing
@@ -48,15 +49,20 @@ def sample_molecule(
     tokens = [BOS, EOS]
     
     intermediate_smiles = []
+    t = 0.0
     
     with torch.no_grad():
         low_rate_steps = 0
         for step in range(max_steps):
             # Determine t for this step
-            if t_schedule == "linear_decay":
+            if t_schedule == "ctmc":
+                t = min(1.0, t + step_size)
+            elif t_schedule == "linear_decay":
                 t = 0.9 - (0.8 * step / max_steps)  # Decay from 0.9 to 0.1
-            else:
+            elif t_schedule == "constant":
                 t = t_value
+            else:
+                raise ValueError(f"Unknown t_schedule: {t_schedule}")
             
             # Encode tokens
             ids = encode(tokens, token_to_id)
@@ -76,58 +82,66 @@ def sample_molecule(
             sub_tok_logits = sub_tok_logits[0].cpu()  # [S, V]
             ins_tok_logits = ins_tok_logits[0].cpu()  # [S+1, V]
 
-            forbidden_ids = [token_to_id[BOS], token_to_id[EOS], token_to_id[PAD]]
+            forbidden_ids = [token_to_id[BOS], token_to_id[EOS], token_to_id[PAD], token_to_id[UNK]]
             sub_tok_logits = mask_token_logits(sub_tok_logits, forbidden_ids)
             ins_tok_logits = mask_token_logits(ins_tok_logits, forbidden_ids)
             
             S = len(tokens)
             
-            candidates: List[Tuple[str, int, float, Optional[torch.Tensor]]] = []
+            # Sample independent edit events with probability h * lambda
+            del_set = set()
+            sub_map = {}
+            ins_map = {}
+
             for i in range(1, S - 1):
                 rate = del_rates[i].item()
-                candidates.append(("DEL", i, rate, None))
+                p = min(1.0, step_size * rate)
+                if torch.rand(1).item() < p:
+                    del_set.add(i)
+
             for i in range(1, S - 1):
                 rate = sub_rates[i].item()
-                candidates.append(("SUB", i, rate, sub_tok_logits[i]))
+                p = min(1.0, step_size * rate)
+                if torch.rand(1).item() < p:
+                    tok_probs = torch.softmax(sub_tok_logits[i] / temperature, dim=0)
+                    tok_id = torch.multinomial(tok_probs, 1).item()
+                    sub_map[i] = id_to_token[tok_id]
+
             for g in range(1, S):
                 rate = ins_rates[g].item()
-                candidates.append(("INS", g, rate, ins_tok_logits[g]))
+                p = min(1.0, step_size * rate)
+                if torch.rand(1).item() < p:
+                    tok_probs = torch.softmax(ins_tok_logits[g] / temperature, dim=0)
+                    tok_id = torch.multinomial(tok_probs, 1).item()
+                    ins_map[g] = id_to_token[tok_id]
 
-            total_rate = sum(c[2] for c in candidates)
-            if total_rate < stop_threshold:
-                low_rate_steps += 1
-            else:
-                low_rate_steps = 0
-            if low_rate_steps >= stop_patience:
-                if verbose:
-                    print(f"Step {step}: stopping due to low total rate")
-                break
+            if t_schedule != "ctmc":
+                total_rate = del_rates[1:S-1].sum() + sub_rates[1:S-1].sum() + ins_rates[1:S].sum()
+                if total_rate.item() < stop_threshold:
+                    low_rate_steps += 1
+                else:
+                    low_rate_steps = 0
+                if low_rate_steps >= stop_patience:
+                    if verbose:
+                        print(f"Step {step}: stopping due to low total rate")
+                    break
 
-            if total_rate <= 0:
-                break
+            if not del_set and not sub_map and not ins_map:
+                if t_schedule == "ctmc" and t >= 1.0:
+                    break
+                continue
 
-            weights = torch.tensor([c[2] for c in candidates], dtype=torch.float32)
-            probs = weights / weights.sum()
-            idx = torch.multinomial(probs, 1).item()
-            op_type, pos, score, tok_logits = candidates[idx]
-
-            if op_type in {"SUB", "INS"}:
-                tok_probs = torch.softmax(tok_logits / temperature, dim=0)
-                tok_id = torch.multinomial(tok_probs, 1).item()
-                tok = id_to_token[tok_id]
-            else:
-                tok = None
-            
-            # Create edit operation
-            if op_type == "DEL":
-                edit = EditOp(type=EditType.DEL, i=pos)
-            elif op_type == "SUB":
-                edit = EditOp(type=EditType.SUB, i=pos, tok=tok)
-            elif op_type == "INS":
-                edit = EditOp(type=EditType.INS, g=pos, tok=tok)
-            
-            # Apply edit
-            new_tokens = apply_edit(tokens, edit)
+            # Apply all edits simultaneously
+            new_tokens = []
+            for idx in range(S):
+                if idx in ins_map:
+                    new_tokens.append(ins_map[idx])
+                if idx in del_set:
+                    continue
+                if idx in sub_map:
+                    new_tokens.append(sub_map[idx])
+                else:
+                    new_tokens.append(tokens[idx])
             
             # Validate (detokenize and check)
             smiles_candidate = detokenize(new_tokens)
@@ -136,46 +150,8 @@ def sample_molecule(
             if verbose:
                 print(f"Step {step}: {op_type} at {pos} (rate={score:.3f}) -> {smiles_candidate} (valid={is_valid})")
             
-            if not is_valid:
-                # Try next candidates by descending rate
-                retry_count = 0
-                found_valid = False
-                alt_candidates = sorted(candidates, key=lambda x: x[2], reverse=True)
-                for alt_idx in range(1, min(len(alt_candidates), max_retries + 1)):
-                    alt_op_type, alt_pos, alt_score, alt_tok_logits = alt_candidates[alt_idx]
-                    
-                    # Sample token if needed
-                    if alt_op_type in ["SUB", "INS"]:
-                        tok_probs = torch.softmax(alt_tok_logits / temperature, dim=0)
-                        alt_tok_id = torch.multinomial(tok_probs, 1).item()
-                        alt_tok = id_to_token[alt_tok_id]
-                    else:
-                        alt_tok = None
-                    
-                    # Create and apply edit
-                    if alt_op_type == "DEL":
-                        alt_edit = EditOp(type=EditType.DEL, i=alt_pos)
-                    elif alt_op_type == "SUB":
-                        alt_edit = EditOp(type=EditType.SUB, i=alt_pos, tok=alt_tok)
-                    else:
-                        alt_edit = EditOp(type=EditType.INS, g=alt_pos, tok=alt_tok)
-                    
-                    alt_tokens = apply_edit(tokens, alt_edit)
-                    alt_smiles = detokenize(alt_tokens)
-                    
-                    if is_valid_smiles(alt_smiles):
-                        new_tokens = alt_tokens
-                        smiles_candidate = alt_smiles
-                        is_valid = True
-                        found_valid = True
-                        if verbose:
-                            print(f"  -> Retry successful: {alt_smiles}")
-                        break
-                
-                if not found_valid:
-                    if verbose:
-                        print(f"  -> All retries failed, keeping invalid edit")
-                    # Accept invalid edit and continue (or could break here)
+            if not is_valid and verbose:
+                print(f"  -> Invalid SMILES, continuing")
             
             tokens = new_tokens
             intermediate_smiles.append(smiles_candidate)

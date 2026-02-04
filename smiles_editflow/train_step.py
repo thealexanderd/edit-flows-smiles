@@ -177,7 +177,7 @@ def train_step(
     x0_mode: str = "uniform",
     x0_max_len: int = 32,
     kappa_power: int = 3,
-    beta: float = 1e-3,
+    beta: float = 1.0,
 ) -> Dict:
     """
     Perform a single training step.
@@ -225,7 +225,7 @@ def train_step(
         token_ids, attn_mask, t
     )
 
-    forbidden_ids = [token_to_id[BOS], token_to_id[EOS], token_to_id[PAD]]
+    forbidden_ids = [token_to_id[BOS], token_to_id[EOS], token_to_id[PAD], token_to_id[UNK]]
     sub_tok_logits = mask_token_logits(sub_tok_logits, forbidden_ids)
     ins_tok_logits = mask_token_logits(ins_tok_logits, forbidden_ids)
 
@@ -237,7 +237,8 @@ def train_step(
     sub_targets = batch["sub_targets"]
     ins_targets = batch["ins_targets"]
 
-    t_weight = kappa_derivative(t, power=kappa_power)
+    kappa_val = t ** kappa_power
+    pos_weight = kappa_derivative(t, power=kappa_power) / (1.0 - kappa_val + 1e-8)
 
     losses = compute_losses_editflows(
         del_rates, sub_rates, ins_rates,
@@ -247,8 +248,8 @@ def train_step(
         bos_id=token_to_id[BOS],
         eos_id=token_to_id[EOS],
         pad_id=token_to_id[PAD],
-        beta=beta,
-        t_weight=t_weight,
+        rate_weight=beta,
+        pos_weight=pos_weight,
     )
     
     # Backward pass

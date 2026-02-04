@@ -144,8 +144,8 @@ def compute_losses_editflows(
     bos_id: int,
     eos_id: int,
     pad_id: int,
-    beta: float = 1e-3,
-    t_weight: Optional[torch.Tensor] = None,
+    rate_weight: float = 1.0,
+    pos_weight: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
 ) -> Dict[str, torch.Tensor]:
     """Compute Edit Flows rate-based loss with CTMC-inspired objective."""
@@ -169,7 +169,7 @@ def compute_losses_editflows(
     tok_total = 0
 
     for b in range(B):
-        w = t_weight[b] if t_weight is not None else 1.0
+        w_pos = pos_weight[b] if pos_weight is not None else 1.0
 
         del_rate_b = del_rates[b]
         sub_rate_b = sub_rates[b]
@@ -181,8 +181,8 @@ def compute_losses_editflows(
             lpos = -torch.log(del_rate_b[del_idx] + eps).sum()
         else:
             lpos = torch.tensor(0.0, device=device)
-        lneg = beta * del_rate_b[valid_del_sub[b]].sum()
-        loss_del_total = loss_del_total + w * (lpos + lneg)
+        lneg = rate_weight * del_rate_b[valid_del_sub[b]].sum()
+        loss_del_total = loss_del_total + w_pos * lpos + lneg
 
         sub_targets_b = sub_targets[b]
         if sub_targets_b:
@@ -190,8 +190,8 @@ def compute_losses_editflows(
             lpos = -torch.log(sub_rate_b[sub_idx] + eps).sum()
         else:
             lpos = torch.tensor(0.0, device=device)
-        lneg = beta * sub_rate_b[valid_del_sub[b]].sum()
-        loss_sub_total = loss_sub_total + w * (lpos + lneg)
+        lneg = rate_weight * sub_rate_b[valid_del_sub[b]].sum()
+        loss_sub_total = loss_sub_total + w_pos * lpos + lneg
 
         ins_targets_b = ins_targets[b]
         if ins_targets_b:
@@ -199,13 +199,13 @@ def compute_losses_editflows(
             lpos = -torch.log(ins_rate_b[ins_idx] + eps).sum()
         else:
             lpos = torch.tensor(0.0, device=device)
-        lneg = beta * ins_rate_b[valid_ins[b]].sum()
-        loss_ins_total = loss_ins_total + w * (lpos + lneg)
+        lneg = rate_weight * ins_rate_b[valid_ins[b]].sum()
+        loss_ins_total = loss_ins_total + w_pos * lpos + lneg
 
         for pos, tok_id in sub_targets_b:
             if pos < S:
                 logits = sub_tok_logits[b, pos]
-                loss_tok_total = loss_tok_total + w * F.cross_entropy(
+                loss_tok_total = loss_tok_total + w_pos * F.cross_entropy(
                     logits.unsqueeze(0),
                     torch.tensor([tok_id], device=device),
                     reduction="sum",
@@ -217,7 +217,7 @@ def compute_losses_editflows(
         for gap, tok_id in ins_targets_b:
             if gap <= S:
                 logits = ins_tok_logits[b, gap]
-                loss_tok_total = loss_tok_total + w * F.cross_entropy(
+                loss_tok_total = loss_tok_total + w_pos * F.cross_entropy(
                     logits.unsqueeze(0),
                     torch.tensor([tok_id], device=device),
                     reduction="sum",

@@ -71,7 +71,7 @@ def main():
     parser.add_argument("--aligned-length", type=int, default=160, help="Aligned length N for edit flows")
     parser.add_argument("--x0-mode", type=str, default="uniform", choices=["uniform", "empty"], help="x0 initialization mode")
     parser.add_argument("--x0-max-len", type=int, default=32, help="Max length for uniform x0")
-    parser.add_argument("--beta", type=float, default=1e-3, help="Rate regularizer for edit flows")
+    parser.add_argument("--beta", type=float, default=1.0, help="Rate regularizer for edit flows")
     parser.add_argument("--kappa-power", type=int, default=3, help="Power for kappa(t)=t^power")
     
     args = parser.parse_args()
