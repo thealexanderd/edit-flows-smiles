@@ -4,6 +4,7 @@ import os
 import argparse
 import torch
 import torch.optim as optim
+import math
 from pathlib import Path
 
 from smiles_editflow.tokenizer import build_vocab
@@ -64,6 +65,9 @@ def main():
     parser.add_argument("--nhead", type=int, default=4, help="Number of attention heads")
     parser.add_argument("--num-layers", type=int, default=3, help="Number of transformer layers")
     parser.add_argument("--lr", type=float, default=0.0003, help="Learning rate")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for AdamW")
+    parser.add_argument("--warmup-steps", type=int, default=2000, help="Warmup steps for LR schedule")
+    parser.add_argument("--lr-schedule", type=str, default="cosine", choices=["cosine", "constant"], help="Learning rate schedule")
     parser.add_argument("--sample-every", type=int, default=100, help="Sample molecules every N steps")
     parser.add_argument("--device", type=str, default="cpu", help="Device (cpu or cuda)")
     parser.add_argument("--tiny", action="store_true", help="Tiny mode: overfit on 50 molecules")
@@ -128,8 +132,31 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {num_params:,}")
     
-    # Create optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    # Create optimizer (paper uses AdamW with betas 0.9, 0.95)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.95),
+        weight_decay=args.weight_decay,
+    )
+
+    # Learning rate schedule with warmup + cosine decay (paper default)
+    if args.lr_schedule == "cosine":
+        warmup = max(0, args.warmup_steps)
+        total = max(1, args.steps)
+
+        def lr_lambda(step: int) -> float:
+            if warmup > 0 and step < warmup:
+                return float(step + 1) / float(warmup)
+            if total <= warmup:
+                return 1.0
+            progress = (step - warmup) / float(total - warmup)
+            progress = min(max(progress, 0.0), 1.0)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    else:
+        scheduler = None
     
     # Training loop
     print(f"\nStarting training for {args.steps} steps...")
@@ -163,6 +190,9 @@ def main():
                   f"DEL: {result['loss_del']:.3f} | SUB: {result['loss_sub']:.3f} | "
                   f"INS: {result['loss_ins']:.3f} | TOK: {result['loss_tok']:.3f} | "
                   f"EditAcc: {result.get('edit_type_acc', 0.0):.3f} | TokAcc: {result.get('tok_acc', 0.0):.3f}")
+
+        if scheduler is not None:
+            scheduler.step()
         
         # Sample molecules
         if (step + 1) % args.sample_every == 0:
