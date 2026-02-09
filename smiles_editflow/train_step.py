@@ -8,7 +8,13 @@ import torch.nn.functional as F
 from .chemistry import randomized_smiles, canonicalize_smiles
 from .tokenizer import tokenize, add_special, encode, BOS, EOS, PAD, UNK
 from .edit_distance import align_with_epsilon
-from .alignment import make_alignment_fixed_N, sample_z_t, strip_epsilon, extract_targets
+from .alignment import (
+    make_alignment_fixed_N,
+    sample_z_t,
+    strip_epsilon,
+    extract_targets,
+    build_uniform_halfhalf_alignment,
+)
 from .losses import compute_losses_editflows
 from .masking import mask_token_logits
 
@@ -64,6 +70,8 @@ def prepare_training_batch(
     x0_mode: str = "uniform",
     x0_max_len: int = 32,
     kappa_power: int = 3,
+    emp_tokens: Optional[List[str]] = None,
+    emp_weights: Optional[List[float]] = None,
 ) -> Optional[Dict]:
     """
     Prepare a training batch from SMILES strings.
@@ -80,6 +88,13 @@ def prepare_training_batch(
         tok for tok in vocab_set
         if tok not in {BOS, EOS, PAD, UNK}
     ]
+    if x0_mode == "uniform_halfhalf":
+        if emp_tokens is None or emp_weights is None:
+            raise ValueError("uniform_halfhalf requires emp_tokens and emp_weights")
+        if len(emp_tokens) == 0:
+            raise ValueError("uniform_halfhalf requires non-empty empirical token list")
+        if len(emp_tokens) != len(emp_weights):
+            raise ValueError("emp_tokens and emp_weights must have the same length")
 
     batch_data = []
 
@@ -99,15 +114,28 @@ def prepare_training_batch(
         x1_tokens = tokens
         if x0_mode == "empty":
             x0_tokens = []
-        else:
+        elif x0_mode == "uniform":
             max_len = max(0, x0_max_len)
             L0 = rng.randint(0, max_len)
             if vocab_tokens:
                 x0_tokens = [rng.choice(vocab_tokens) for _ in range(L0)]
             else:
                 x0_tokens = []
+        elif x0_mode == "uniform_halfhalf":
+            max_len = max(0, x0_max_len)
+            L0_raw = rng.randint(0, max_len)
+            L0 = min(L0_raw, 2 * len(x1_tokens))
+            if L0 > 0:
+                x0_tokens = rng.choices(emp_tokens, weights=emp_weights, k=L0)
+            else:
+                x0_tokens = []
+        else:
+            raise ValueError(f"Unknown x0_mode: {x0_mode}")
 
-        a0, a1 = align_with_epsilon(x0_tokens, x1_tokens)
+        if x0_mode == "uniform_halfhalf":
+            a0, a1 = build_uniform_halfhalf_alignment(x0_tokens, x1_tokens)
+        else:
+            a0, a1 = align_with_epsilon(x0_tokens, x1_tokens)
         if len(a0) > aligned_length:
             continue
         z0, z1 = make_alignment_fixed_N(a0, a1, aligned_length, rng)
@@ -178,6 +206,8 @@ def train_step(
     x0_max_len: int = 32,
     kappa_power: int = 3,
     beta: float = 1.0,
+    emp_tokens: Optional[List[str]] = None,
+    emp_weights: Optional[List[float]] = None,
 ) -> Dict:
     """
     Perform a single training step.
@@ -210,6 +240,8 @@ def train_step(
         x0_mode=x0_mode,
         x0_max_len=x0_max_len,
         kappa_power=kappa_power,
+        emp_tokens=emp_tokens,
+        emp_weights=emp_weights,
     )
     
     if batch is None:

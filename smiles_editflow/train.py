@@ -5,13 +5,48 @@ import argparse
 import torch
 import torch.optim as optim
 import math
+from collections import Counter
 from pathlib import Path
 
-from smiles_editflow.tokenizer import build_vocab
+from smiles_editflow.tokenizer import build_vocab, tokenize, SPECIAL_TOKENS
 from smiles_editflow.model import EditFlowModel
 from smiles_editflow.train_step import train_step
 from smiles_editflow.sampler import sample_molecule
 from smiles_editflow.chemistry import filter_smiles, canonicalize_smiles
+
+
+MODEL_PRESETS = {
+    # Paper-scale targets. This implementation uses a PyTorch Transformer encoder,
+    # not a Llama architecture, so this is an approximate size match.
+    "paper_280m": {
+        "d_model": 1024,
+        "nhead": 16,
+        "num_layers": 12,
+        "dim_feedforward": 6963,
+        "max_len": 1024,
+        "aligned_length": 1024,
+        "batch_size": 4096,
+        "steps": 500000,
+        "vocab_size": 32000,
+        "lr": 3e-4,
+        "warmup_steps": 2000,
+        "lr_schedule": "cosine",
+    },
+    "paper_1_3b": {
+        "d_model": 2048,
+        "nhead": 32,
+        "num_layers": 16,
+        "dim_feedforward": 12288,
+        "max_len": 1024,
+        "aligned_length": 1024,
+        "batch_size": 4096,
+        "steps": 500000,
+        "vocab_size": 32000,
+        "lr": 3e-4,
+        "warmup_steps": 2000,
+        "lr_schedule": "cosine",
+    },
+}
 
 
 def load_smiles_dataset(file_path: str, max_samples: int = None) -> list:
@@ -56,6 +91,13 @@ def load_smiles_dataset(file_path: str, max_samples: int = None) -> list:
 
 def main():
     parser = argparse.ArgumentParser(description="Train SMILES Edit Flow model")
+    parser.add_argument(
+        "--model-config",
+        type=str,
+        default="paper_280m",
+        choices=["paper_280m", "paper_1_3b", "custom"],
+        help="Model/training preset. 'custom' uses explicit CLI values.",
+    )
     parser.add_argument("--data", type=str, default="data/smiles.txt", help="Path to SMILES data file")
     parser.add_argument("--max-data", type=int, default=1000, help="Maximum number of SMILES to use")
     parser.add_argument("--vocab-size", type=int, default=500, help="Build vocab from first N molecules")
@@ -64,6 +106,9 @@ def main():
     parser.add_argument("--d-model", type=int, default=128, help="Model dimension")
     parser.add_argument("--nhead", type=int, default=4, help="Number of attention heads")
     parser.add_argument("--num-layers", type=int, default=3, help="Number of transformer layers")
+    parser.add_argument("--dim-feedforward", type=int, default=1024, help="Transformer feedforward dimension")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Transformer dropout")
+    parser.add_argument("--max-len", type=int, default=512, help="Maximum sequence length for positional encoding")
     parser.add_argument("--lr", type=float, default=0.0003, help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for AdamW")
     parser.add_argument("--warmup-steps", type=int, default=2000, help="Warmup steps for LR schedule")
@@ -73,16 +118,30 @@ def main():
     parser.add_argument("--tiny", action="store_true", help="Tiny mode: overfit on 50 molecules")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save model")
     parser.add_argument("--aligned-length", type=int, default=160, help="Aligned length N for edit flows")
-    parser.add_argument("--x0-mode", type=str, default="uniform", choices=["uniform", "empty"], help="x0 initialization mode")
-    parser.add_argument("--x0-max-len", type=int, default=32, help="Max length for uniform x0")
+    parser.add_argument(
+        "--x0-mode",
+        type=str,
+        default="uniform_halfhalf",
+        choices=["uniform_halfhalf", "uniform", "empty"],
+        help="x0 initialization mode",
+    )
+    parser.add_argument("--x0-max-len", type=int, default=32, help="Max length for sampled x0 in uniform modes")
     parser.add_argument("--beta", type=float, default=1.0, help="Rate regularizer for edit flows")
     parser.add_argument("--kappa-power", type=int, default=3, help="Power for kappa(t)=t^power")
     
     args = parser.parse_args()
-    
+
+    if args.model_config != "custom":
+        preset = MODEL_PRESETS[args.model_config]
+        for key, value in preset.items():
+            setattr(args, key, value)
+
     print("=" * 60)
     print("SMILES Edit Flow Training")
     print("=" * 60)
+    if args.model_config != "custom":
+        print(f"Preset: {args.model_config} (paper-scale approximation)")
+        print("Note: architecture is Transformer encoder, not Llama/FlexAttention.")
     
     # Load data
     print(f"\nLoading SMILES from {args.data}...")
@@ -109,6 +168,22 @@ def main():
         valid_smiles = valid_smiles[:50]
         args.steps = 300
         args.sample_every = 50
+
+    # Build empirical token marginal p_emp from training corpus.
+    token_counter = Counter()
+    for smi in valid_smiles:
+        for tok in tokenize(smi):
+            if tok not in SPECIAL_TOKENS:
+                token_counter[tok] += 1
+
+    if not token_counter:
+        print("Error: Empirical token distribution is empty. Check training data/tokenizer.")
+        return
+
+    emp_tokens = sorted(token_counter.keys())
+    total_count = sum(token_counter[t] for t in emp_tokens)
+    emp_weights = [token_counter[t] / total_count for t in emp_tokens]
+    print(f"Empirical token support: {len(emp_tokens)}")
     
     # Build vocabulary
     print(f"\nBuilding vocabulary from {min(args.vocab_size, len(valid_smiles))} molecules...")
@@ -126,6 +201,9 @@ def main():
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,
+        dim_feedforward=args.dim_feedforward,
+        dropout=args.dropout,
+        max_len=args.max_len,
     )
     model.to(args.device)
     
@@ -182,6 +260,8 @@ def main():
             x0_max_len=args.x0_max_len,
             kappa_power=args.kappa_power,
             beta=args.beta,
+            emp_tokens=emp_tokens,
+            emp_weights=emp_weights,
         )
         
         # Log

@@ -120,8 +120,8 @@ python smiles_editflow/train.py \
 - `--tiny`: Use tiny mode for quick testing
 - `--save-dir`: Directory to save model checkpoints (default: `checkpoints`)
 - `--aligned-length`: Aligned length `N` for epsilon alignment (default: 160)
-- `--x0-mode`: Source init mode (`uniform` or `empty`)
-- `--x0-max-len`: Max length for uniform `x0`
+- `--x0-mode`: Source init mode (`uniform_halfhalf`, `uniform`, or `empty`)
+- `--x0-max-len`: Max length for sampled `x0` in `uniform_halfhalf`/`uniform`
 - `--beta`: Rate regularizer for Edit Flows
 - `--kappa-power`: Power for `kappa(t) = t^power`
 
@@ -240,8 +240,14 @@ For each training example:
 
 1. Canonicalize and randomize SMILES (augmentation)
 2. Tokenize to get `x1`
-3. Sample `x0` (empty or random tokens)
+3. Sample `x0`:
+   - `empty`: `x0 = []`
+   - `uniform`: random tokens sampled uniformly from vocab
+   - `uniform_halfhalf` (paper variant): tokens sampled from empirical token marginal `p_emp`
 4. Compute epsilon alignment `(a0, a1)` and pad to fixed length `N`
+   - In `uniform_halfhalf`, alignment is forced to paper-style half/half:
+     first `floor(L0/2)` `x0` tokens delete, remaining `ceil(L0/2)` substitute,
+     and leftover `x1` tokens insert.
 5. Sample `t` in `(0,1)` and draw `z_t` via `kappa(t) = t^3`
 6. Strip epsilons to get `x_t`
 7. Extract multiple edit targets from `(z_t, z1)`

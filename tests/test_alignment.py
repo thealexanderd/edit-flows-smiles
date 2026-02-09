@@ -2,7 +2,14 @@
 
 import random
 
-from smiles_editflow.alignment import EPS, strip_epsilon, make_alignment_fixed_N, sample_z_t, extract_targets
+from smiles_editflow.alignment import (
+    EPS,
+    strip_epsilon,
+    make_alignment_fixed_N,
+    sample_z_t,
+    extract_targets,
+    build_uniform_halfhalf_alignment,
+)
 from smiles_editflow.edit_distance import align_with_epsilon, levenshtein_script
 from smiles_editflow.tokenizer import add_special, build_vocab, BOS, EOS, PAD, UNK, tokenize
 from smiles_editflow.chemistry import canonicalize_smiles, randomized_smiles
@@ -160,3 +167,98 @@ def test_prepare_training_batch_bos_shift_deletes():
     assert batch["del_targets"][0] == expected_del
     assert batch["sub_targets"][0] == expected_sub
     assert batch["ins_targets"][0] == expected_ins
+
+
+def test_uniform_halfhalf_alignment_counts_even():
+    x0 = [f"X{i}" for i in range(10)]
+    x1 = [f"T{i}" for i in range(13)]
+
+    a0, a1 = build_uniform_halfhalf_alignment(x0, x1)
+
+    delete_count = sum(1 for u, v in zip(a0, a1) if u != EPS and v == EPS)
+    sub_count = sum(1 for u, v in zip(a0, a1) if u != EPS and v != EPS)
+    ins_count = sum(1 for u, v in zip(a0, a1) if u == EPS and v != EPS)
+
+    assert len(a0) == len(a1)
+    assert delete_count == 5
+    assert sub_count == 5
+    assert ins_count == len(x1) - 5
+
+
+def test_uniform_halfhalf_alignment_counts_odd():
+    x0 = [f"X{i}" for i in range(9)]
+    x1 = [f"T{i}" for i in range(12)]
+
+    a0, a1 = build_uniform_halfhalf_alignment(x0, x1)
+
+    delete_count = sum(1 for u, v in zip(a0, a1) if u != EPS and v == EPS)
+    sub_count = sum(1 for u, v in zip(a0, a1) if u != EPS and v != EPS)
+    ins_count = sum(1 for u, v in zip(a0, a1) if u == EPS and v != EPS)
+
+    assert len(a0) == len(a1)
+    assert delete_count == 4
+    assert sub_count == 5
+    assert ins_count == len(x1) - 5
+
+
+def test_uniform_halfhalf_strip_roundtrip():
+    x0 = ["N", "N", "N", "N", "N"]
+    x1 = ["C", "C", "O", "C"]
+
+    a0, a1 = build_uniform_halfhalf_alignment(x0, x1)
+
+    assert strip_epsilon(a0) == x0
+    assert strip_epsilon(a1) == x1
+
+
+def test_prepare_batch_uniform_halfhalf_uses_mode():
+    smiles_list = ["CCO"]
+    token_to_id, id_to_token = build_vocab(smiles_list)
+    vocab_set = set(token_to_id.keys())
+
+    batch = prepare_training_batch(
+        smiles_list,
+        token_to_id,
+        id_to_token,
+        vocab_set,
+        t_min=0.0,
+        t_max=0.0,
+        seed=0,
+        aligned_length=16,
+        x0_mode="uniform_halfhalf",
+        x0_max_len=4,
+        kappa_power=3,
+        emp_tokens=["N"],
+        emp_weights=[1.0],
+    )
+
+    assert batch is not None
+    assert len(batch["del_targets"][0]) > 0
+    assert len(batch["sub_targets"][0]) > 0
+
+
+def test_prepare_batch_uniform_halfhalf_length_clamp():
+    smiles_list = ["C"]
+    token_to_id, id_to_token = build_vocab(smiles_list)
+    vocab_set = set(token_to_id.keys())
+
+    batch = prepare_training_batch(
+        smiles_list,
+        token_to_id,
+        id_to_token,
+        vocab_set,
+        t_min=0.0,
+        t_max=0.0,
+        seed=0,
+        aligned_length=16,
+        x0_mode="uniform_halfhalf",
+        x0_max_len=10,
+        kappa_power=3,
+        emp_tokens=["N"],
+        emp_weights=[1.0],
+    )
+
+    assert batch is not None
+    # x1 has length 1 => clamp enforces L0 <= 2, so at t=0 we should have exactly 2 non-insert edits.
+    assert len(batch["del_targets"][0]) + len(batch["sub_targets"][0]) == 2
+    assert len(batch["ins_targets"][0]) == 0

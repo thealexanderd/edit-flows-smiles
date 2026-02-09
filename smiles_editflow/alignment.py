@@ -11,6 +11,58 @@ def strip_epsilon(z: List[str]) -> List[str]:
     return [tok for tok in z if tok != EPS]
 
 
+def build_uniform_halfhalf_alignment(
+    x0_tokens: List[str],
+    x1_tokens: List[str],
+) -> Tuple[List[str], List[str]]:
+    """
+    Construct paper-style Uniform X0 half/half alignment.
+
+    For an x0 sequence of length L0:
+    - first floor(L0/2) tokens are aligned as deletions
+    - remaining ceil(L0/2) tokens are aligned as substitutions
+    - any remaining x1 tokens are aligned as insertions
+
+    Args:
+        x0_tokens: Source tokens sampled from empirical token marginal.
+        x1_tokens: Target tokens.
+
+    Returns:
+        (a0, a1) aligned lists with EPS placeholders.
+    """
+    L0 = len(x0_tokens)
+    del_count = L0 // 2
+    sub_count = L0 - del_count
+
+    if len(x1_tokens) < sub_count:
+        raise ValueError(
+            f"Need len(x1_tokens) >= {sub_count} for half/half substitutions, got {len(x1_tokens)}"
+        )
+
+    a0: List[str] = []
+    a1: List[str] = []
+
+    # Delete half of x0.
+    for i in range(del_count):
+        a0.append(x0_tokens[i])
+        a1.append(EPS)
+
+    # Substitute the remaining half against the start of x1.
+    j = 0
+    for i in range(del_count, L0):
+        a0.append(x0_tokens[i])
+        a1.append(x1_tokens[j])
+        j += 1
+
+    # Insert the remaining x1 suffix.
+    while j < len(x1_tokens):
+        a0.append(EPS)
+        a1.append(x1_tokens[j])
+        j += 1
+
+    return a0, a1
+
+
 def make_alignment_fixed_N(
     a0: List[str],
     a1: List[str],
