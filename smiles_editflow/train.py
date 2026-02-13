@@ -16,15 +16,20 @@ from smiles_editflow.chemistry import filter_smiles, canonicalize_smiles
 
 
 MODEL_PRESETS = {
-    # Paper-scale targets. This implementation uses a PyTorch Transformer encoder,
-    # not a Llama architecture, so this is an approximate size match.
+    # Paper-inspired configs adapted to SMILES length statistics.
+    # This codebase uses token-level SMILES with much shorter sequences than text/code.
     "paper_280m": {
+        "backbone": "llama",
         "d_model": 1024,
         "nhead": 16,
+        "num_kv_heads": 8,
         "num_layers": 12,
-        "dim_feedforward": 6963,
-        "max_len": 1024,
-        "aligned_length": 1024,
+        # Llama intermediate_size (paper table feed-forward dimension).
+        "dim_feedforward": 1740,
+        "dropout": 0.0,
+        "max_len": 128,
+        "aligned_length": 128,
+        "x0_max_len": 80,
         "batch_size": 4096,
         "steps": 500000,
         "vocab_size": 32000,
@@ -33,12 +38,17 @@ MODEL_PRESETS = {
         "lr_schedule": "cosine",
     },
     "paper_1_3b": {
+        "backbone": "llama",
         "d_model": 2048,
         "nhead": 32,
+        "num_kv_heads": 8,
         "num_layers": 16,
-        "dim_feedforward": 12288,
-        "max_len": 1024,
-        "aligned_length": 1024,
+        # Llama intermediate_size (paper table feed-forward dimension).
+        "dim_feedforward": 3072,
+        "dropout": 0.0,
+        "max_len": 128,
+        "aligned_length": 128,
+        "x0_max_len": 80,
         "batch_size": 4096,
         "steps": 500000,
         "vocab_size": 32000,
@@ -105,10 +115,12 @@ def main():
     parser.add_argument("--steps", type=int, default=500, help="Number of training steps")
     parser.add_argument("--d-model", type=int, default=128, help="Model dimension")
     parser.add_argument("--nhead", type=int, default=4, help="Number of attention heads")
+    parser.add_argument("--num-kv-heads", type=int, default=None, help="KV heads (Llama backbone)")
     parser.add_argument("--num-layers", type=int, default=3, help="Number of transformer layers")
     parser.add_argument("--dim-feedforward", type=int, default=1024, help="Transformer feedforward dimension")
     parser.add_argument("--dropout", type=float, default=0.1, help="Transformer dropout")
     parser.add_argument("--max-len", type=int, default=512, help="Maximum sequence length for positional encoding")
+    parser.add_argument("--backbone", type=str, default="transformer", choices=["transformer", "llama"], help="Backbone architecture")
     parser.add_argument("--lr", type=float, default=0.0003, help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for AdamW")
     parser.add_argument("--warmup-steps", type=int, default=2000, help="Warmup steps for LR schedule")
@@ -141,7 +153,9 @@ def main():
     print("=" * 60)
     if args.model_config != "custom":
         print(f"Preset: {args.model_config} (paper-scale approximation)")
-        print("Note: architecture is Transformer encoder, not Llama/FlexAttention.")
+        print(f"Backbone: {args.backbone}")
+        if args.backbone != "llama":
+            print("Note: paper uses Llama-style architecture.")
     
     # Load data
     print(f"\nLoading SMILES from {args.data}...")
@@ -200,10 +214,12 @@ def main():
         vocab_size=len(token_to_id),
         d_model=args.d_model,
         nhead=args.nhead,
+        num_kv_heads=args.num_kv_heads,
         num_layers=args.num_layers,
         dim_feedforward=args.dim_feedforward,
         dropout=args.dropout,
         max_len=args.max_len,
+        backbone=args.backbone,
     )
     model.to(args.device)
     

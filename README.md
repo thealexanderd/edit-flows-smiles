@@ -113,7 +113,9 @@ python smiles_editflow/train.py \
 - `--steps`: Number of training steps (default: 500)
 - `--d-model`: Model dimension (default: 128)
 - `--nhead`: Number of attention heads (default: 4)
+- `--num-kv-heads`: Number of KV heads for Llama backbone
 - `--num-layers`: Number of transformer layers (default: 3)
+- `--backbone`: Backbone architecture (`transformer` or `llama`)
 - `--lr`: Learning rate (default: 0.0003)
 - `--sample-every`: Sample molecules every N steps (default: 100)
 - `--device`: Device to use (`cpu` or `cuda`)

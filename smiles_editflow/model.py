@@ -1,4 +1,4 @@
-"""Transformer encoder policy network for edit prediction."""
+"""Edit policy network with selectable Transformer or Llama backbone."""
 
 import math
 import torch
@@ -78,52 +78,93 @@ class EditFlowModel(nn.Module):
         dim_feedforward: int = 1024,
         dropout: float = 0.1,
         max_len: int = 512,
+        backbone: str = "transformer",
+        num_kv_heads: int = None,
     ):
         super().__init__()
-        
+
         self.vocab_size = vocab_size
-        self.d_model = d_model
-        
-        # Token embedding
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
-        
-        # Positional encoding
-        self.pos_encoder = PositionalEncoding(d_model, max_len)
-        
-        # Time embedding
-        self.time_mlp = TimeMLP(d_model)
-        
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.backbone = backbone
+
+        if backbone == "transformer":
+            self.d_model = d_model
+            self.token_embedding = nn.Embedding(vocab_size, d_model)
+            self.pos_encoder = PositionalEncoding(d_model, max_len)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.llama = None
+        elif backbone == "llama":
+            try:
+                from transformers import LlamaConfig, LlamaModel
+            except ImportError as exc:
+                raise ImportError(
+                    "Llama backbone requires 'transformers'. Install with: pip install transformers"
+                ) from exc
+
+            kv_heads = nhead if num_kv_heads is None else num_kv_heads
+            if kv_heads <= 0 or nhead % kv_heads != 0:
+                raise ValueError("num_kv_heads must be > 0 and divide nhead")
+
+            llama_cfg = LlamaConfig(
+                vocab_size=vocab_size,
+                hidden_size=d_model,
+                intermediate_size=dim_feedforward,
+                num_hidden_layers=num_layers,
+                num_attention_heads=nhead,
+                num_key_value_heads=kv_heads,
+                max_position_embeddings=max_len,
+                attention_dropout=dropout,
+                hidden_act="silu",
+                rms_norm_eps=1e-5,
+                tie_word_embeddings=False,
+            )
+            self.llama = LlamaModel(llama_cfg)
+            self.d_model = llama_cfg.hidden_size
+            self.token_embedding = None
+            self.pos_encoder = None
+            self.transformer_encoder = None
+        else:
+            raise ValueError(f"Unknown backbone: {backbone}")
+
+        self.time_mlp = TimeMLP(self.d_model)
         
         # Per-position heads for DEL and SUB
-        self.del_head = nn.Linear(d_model, 1)
-        self.sub_head = nn.Linear(d_model, 1)
-        self.sub_tok_head = nn.Linear(d_model, vocab_size)
+        self.del_head = nn.Linear(self.d_model, 1)
+        self.sub_head = nn.Linear(self.d_model, 1)
+        self.sub_tok_head = nn.Linear(self.d_model, vocab_size)
         
         # Gap representation and INS heads
         self.gap_mlp = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
+            nn.Linear(self.d_model * 2, self.d_model),
             nn.ReLU(),
-            nn.Linear(d_model, d_model),
+            nn.Linear(self.d_model, self.d_model),
         )
-        self.ins_head = nn.Linear(d_model, 1)
-        self.ins_tok_head = nn.Linear(d_model, vocab_size)
+        self.ins_head = nn.Linear(self.d_model, 1)
+        self.ins_tok_head = nn.Linear(self.d_model, vocab_size)
         
-        self._init_weights()
-    
-    def _init_weights(self):
-        """Initialize weights."""
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+        self._init_custom_weights()
+
+    def _init_custom_weights(self):
+        """Initialize edit heads/time MLP without overriding backbone defaults."""
+        modules = [
+            self.time_mlp,
+            self.del_head,
+            self.sub_head,
+            self.sub_tok_head,
+            self.gap_mlp,
+            self.ins_head,
+            self.ins_tok_head,
+        ]
+        for module in modules:
+            for p in module.parameters():
+                if p.dim() > 1:
+                    nn.init.xavier_uniform_(p)
     
     def forward(
         self,
@@ -144,21 +185,25 @@ class EditFlowModel(nn.Module):
         """
         B, S = token_ids.shape
         
-        # Token embedding
-        x = self.token_embedding(token_ids)  # [B, S, d_model]
-        
-        # Add positional encoding
-        x = self.pos_encoder(x)
-        
-        # Add time embedding (broadcast across sequence)
-        time_emb = self.time_mlp(t)  # [B, d_model]
-        x = x + time_emb.unsqueeze(1)  # [B, S, d_model]
-        
-        # Create padding mask for transformer (True = ignore)
-        padding_mask = ~attn_mask  # [B, S]
-        
-        # Transformer encoder
-        H = self.transformer_encoder(x, src_key_padding_mask=padding_mask)  # [B, S, d_model]
+        if self.backbone == "transformer":
+            x = self.token_embedding(token_ids)  # [B, S, d_model]
+            x = self.pos_encoder(x)
+            time_emb = self.time_mlp(t)  # [B, d_model]
+            x = x + time_emb.unsqueeze(1)  # [B, S, d_model]
+            padding_mask = ~attn_mask  # [B, S], True = ignore
+            H = self.transformer_encoder(x, src_key_padding_mask=padding_mask)  # [B, S, d_model]
+        else:
+            # Llama backbone uses RoPE positions internally; inject time through embeddings.
+            x = self.llama.get_input_embeddings()(token_ids)  # [B, S, d_model]
+            time_emb = self.time_mlp(t)
+            x = x + time_emb.unsqueeze(1)
+            llama_mask = attn_mask.to(dtype=torch.long, device=token_ids.device)
+            H = self.llama(
+                inputs_embeds=x,
+                attention_mask=llama_mask,
+                use_cache=False,
+                return_dict=True,
+            ).last_hidden_state
         
         # Per-position deletion and substitution
         del_logits = self.del_head(H).squeeze(-1)  # [B, S]
