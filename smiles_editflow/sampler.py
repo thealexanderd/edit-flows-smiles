@@ -21,6 +21,7 @@ def sample_molecule(
     stop_threshold: float = 1e-3,
     stop_patience: int = 5,
     max_retries: int = 3,
+    max_seq_len: int | None = None,
     verbose: bool = False,
 ) -> tuple[str, bool, List[str]]:
     """
@@ -38,12 +39,19 @@ def sample_molecule(
         temperature: Temperature for sampling
         stop_threshold: Minimum total rate to continue editing
         max_retries: Max retries for invalid edits
+        max_seq_len: Maximum token sequence length including BOS/EOS.
+            If None, inferred from model positional encoding length.
         verbose: Print intermediate steps
         
     Returns:
         (smiles_string, is_valid, intermediate_smiles_list)
     """
     model.eval()
+
+    if max_seq_len is None:
+        max_seq_len = int(model.pos_encoder.pe.size(0))
+    if max_seq_len < 2:
+        raise ValueError("max_seq_len must be >= 2 to fit BOS/EOS")
     
     # Start with empty sequence
     tokens = [BOS, EOS]
@@ -107,13 +115,14 @@ def sample_molecule(
                     tok_id = torch.multinomial(tok_probs, 1).item()
                     sub_map[i] = id_to_token[tok_id]
 
-            for g in range(1, S):
-                rate = ins_rates[g].item()
-                p = min(1.0, step_size * rate)
-                if torch.rand(1).item() < p:
-                    tok_probs = torch.softmax(ins_tok_logits[g] / temperature, dim=0)
-                    tok_id = torch.multinomial(tok_probs, 1).item()
-                    ins_map[g] = id_to_token[tok_id]
+            if S < max_seq_len:
+                for g in range(1, S):
+                    rate = ins_rates[g].item()
+                    p = min(1.0, step_size * rate)
+                    if torch.rand(1).item() < p:
+                        tok_probs = torch.softmax(ins_tok_logits[g] / temperature, dim=0)
+                        tok_id = torch.multinomial(tok_probs, 1).item()
+                        ins_map[g] = id_to_token[tok_id]
 
             if t_schedule != "ctmc":
                 total_rate = del_rates[1:S-1].sum() + sub_rates[1:S-1].sum() + ins_rates[1:S].sum()
@@ -142,13 +151,21 @@ def sample_molecule(
                     new_tokens.append(sub_map[idx])
                 else:
                     new_tokens.append(tokens[idx])
+
+            # Guardrail for positional encoding limits: cap to model-supported length.
+            if len(new_tokens) > max_seq_len:
+                interior = new_tokens[1:-1][: max_seq_len - 2]
+                new_tokens = [BOS] + interior + [EOS]
             
             # Validate (detokenize and check)
             smiles_candidate = detokenize(new_tokens)
             is_valid = is_valid_smiles(smiles_candidate)
             
             if verbose:
-                print(f"Step {step}: {op_type} at {pos} (rate={score:.3f}) -> {smiles_candidate} (valid={is_valid})")
+                print(
+                    f"Step {step}: DEL={len(del_set)} SUB={len(sub_map)} "
+                    f"INS={len(ins_map)} len={len(new_tokens)} -> {smiles_candidate} (valid={is_valid})"
+                )
             
             if not is_valid and verbose:
                 print(f"  -> Invalid SMILES, continuing")

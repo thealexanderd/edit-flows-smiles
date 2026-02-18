@@ -19,18 +19,21 @@ MODEL_PRESETS = {
     # Paper-scale targets. This implementation uses a PyTorch Transformer encoder,
     # not a Llama architecture, so this is an approximate size match.
     "paper_280m": {
-        "d_model": 1024,
-        "nhead": 16,
-        "num_layers": 12,
-        "dim_feedforward": 6963,
-        "max_len": 1024,
-        "aligned_length": 1024,
-        "batch_size": 4096,
+        "d_model": 384,
+        "nhead": 8,
+        "num_layers": 6,
+        "dim_feedforward": 1536,
+        "max_len": 128,
+        "aligned_length": 100,
+        "batch_size": 1024,
         "steps": 500000,
-        "vocab_size": 32000,
+        "vocab_size": 249455,
         "lr": 3e-4,
+        "save_dir": "checkpoints",
+        "save_every": 5000,
         "warmup_steps": 2000,
         "lr_schedule": "cosine",
+        "x0_max_len": 26
     },
     "paper_1_3b": {
         "d_model": 2048,
@@ -117,6 +120,7 @@ def main():
     parser.add_argument("--device", type=str, default="cpu", help="Device (cpu or cuda)")
     parser.add_argument("--tiny", action="store_true", help="Tiny mode: overfit on 50 molecules")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save model")
+    parser.add_argument("--save-every", type=int, default=50000, help="Save intermediate checkpoint every N steps (0 disables)")
     parser.add_argument("--aligned-length", type=int, default=160, help="Aligned length N for edit flows")
     parser.add_argument(
         "--x0-mode",
@@ -235,6 +239,9 @@ def main():
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     else:
         scheduler = None
+
+    if args.save_dir:
+        os.makedirs(args.save_dir, exist_ok=True)
     
     # Training loop
     print(f"\nStarting training for {args.steps} steps...")
@@ -265,7 +272,7 @@ def main():
         )
         
         # Log
-        if step % 10 == 0:
+        if step % 1000 == 0:
             print(f"Step {step:4d} | Loss: {result['loss']:.4f} | "
                   f"DEL: {result['loss_del']:.3f} | SUB: {result['loss_sub']:.3f} | "
                   f"INS: {result['loss_ins']:.3f} | TOK: {result['loss_tok']:.3f} | "
@@ -273,6 +280,23 @@ def main():
 
         if scheduler is not None:
             scheduler.step()
+
+        global_step = step + 1
+        if args.save_dir and args.save_every > 0 and global_step % args.save_every == 0:
+            checkpoint_path = os.path.join(args.save_dir, f"editflow_model_step_{global_step}.pt")
+            torch.save(
+                {
+                    "step": global_step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+                    "token_to_id": token_to_id,
+                    "id_to_token": id_to_token,
+                    "args": vars(args),
+                },
+                checkpoint_path,
+            )
+            print(f"Checkpoint saved to {checkpoint_path}")
         
         # Sample molecules
         if (step + 1) % args.sample_every == 0:
@@ -304,10 +328,12 @@ def main():
     print(f"\nTraining complete!")
     
     if args.save_dir:
-        os.makedirs(args.save_dir, exist_ok=True)
         model_path = os.path.join(args.save_dir, "editflow_model.pt")
         torch.save({
+            "step": args.steps,
             "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "token_to_id": token_to_id,
             "id_to_token": id_to_token,
             "args": vars(args),

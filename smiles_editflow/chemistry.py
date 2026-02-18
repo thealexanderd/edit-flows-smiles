@@ -2,7 +2,12 @@
 
 from typing import Optional
 from rdkit import Chem
+from rdkit import RDLogger
 from rdkit.Chem import Descriptors
+
+# Suppress RDKit parser logs for invalid/corrupt SMILES seen during data filtering.
+RDLogger.DisableLog("rdApp.warning")
+RDLogger.DisableLog("rdApp.error")
 
 
 def smiles_to_mol(smiles: str) -> Optional[Chem.Mol]:
